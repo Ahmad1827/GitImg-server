@@ -1,0 +1,6 @@
+build/
+gitimg
+gitimgd
+.gitimgd/
+.gitimg/
+*.wpk
