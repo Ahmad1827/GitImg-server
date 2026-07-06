@@ -10,7 +10,7 @@ public:
     ClientRepo(const char* dir, const char* default_host, int default_port);
     ~ClientRepo();
     
-    bool init(const char* repo_name, const char* host, int port);
+    bool init(const char* repo_target, const char* host, int port);
     bool commit(const char* message);
     bool checkout(const char* commit_hash_str);
     void watch();
@@ -18,6 +18,7 @@ public:
 private:
     char base_dir[1024];
     char repo_dir[1024];
+    char current_owner[128];
     char current_repo[128];
     char srv_host[256];
     int srv_port;

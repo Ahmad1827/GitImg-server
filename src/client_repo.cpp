@@ -45,13 +45,24 @@ ClientRepo::ClientRepo(const char* dir, const char* default_host, int default_po
     }
     
     strncpy(current_repo, "default", sizeof(current_repo));
+    strncpy(current_owner, "anonymous", sizeof(current_owner));
+    
     snprintf(config_path, sizeof(config_path), "%s/repo_name", repo_dir);
     int fd = open(config_path, O_RDONLY);
     if (fd >= 0) {
-        ssize_t bytes = read(fd, current_repo, sizeof(current_repo) - 1);
+        char buf[256] = {0};
+        ssize_t bytes = read(fd, buf, sizeof(buf) - 1);
         if (bytes > 0) {
-            current_repo[bytes] = '\0';
-            for (int i=0; i<bytes; i++) if (current_repo[i] == '\n') current_repo[i] = '\0';
+            buf[bytes] = '\0';
+            for (int i=0; i<bytes; i++) if (buf[i] == '\n') buf[i] = '\0';
+            char* slash = strchr(buf, '/');
+            if (slash) {
+                *slash = '\0';
+                strncpy(current_owner, buf, 127);
+                strncpy(current_repo, slash + 1, 127);
+            } else {
+                strncpy(current_repo, buf, 127);
+            }
         }
         close(fd);
     }
@@ -62,8 +73,9 @@ ClientRepo::~ClientRepo() {
     if (inotify_fd >= 0) close(inotify_fd);
 }
 
-bool ClientRepo::init(const char* repo_name, const char* host, int port) {
-    struct stat st = {0};
+bool ClientRepo::init(const char* repo_target, const char* host, int port) {
+    struct stat st;
+    memset(&st, 0, sizeof(struct stat));
     if (stat(repo_dir, &st) == -1) {
         if (mkdir(repo_dir, 0755) != 0) return false;
     }
@@ -87,15 +99,28 @@ bool ClientRepo::init(const char* repo_name, const char* host, int port) {
         fclose(fp);
     }
     
-    strncpy(current_repo, repo_name, sizeof(current_repo) - 1);
+    const char* slash = strchr(repo_target, '/');
+    if (slash) {
+        size_t owner_len = slash - repo_target;
+        strncpy(current_owner, repo_target, owner_len);
+        current_owner[owner_len] = '\0';
+        strncpy(current_repo, slash + 1, sizeof(current_repo) - 1);
+    } else {
+        strncpy(current_owner, "anonymous", sizeof(current_owner) - 1);
+        strncpy(current_repo, repo_target, sizeof(current_repo) - 1);
+    }
+
     snprintf(config_path, sizeof(config_path), "%s/repo_name", repo_dir);
     int fd = open(config_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
-        write(fd, current_repo, strlen(current_repo));
+        char target_buf[256];
+        snprintf(target_buf, sizeof(target_buf), "%s/%s", current_owner, current_repo);
+        if(write(fd, target_buf, strlen(target_buf))){}
         close(fd);
     }
     
-    printf("Initialized local workspace in %s\nTargeting remote %s:%d (Repo: %s)\n", repo_dir, srv_host, srv_port, current_repo);
+    printf("Initialized local workspace in %s\nTargeting remote %s:%d (Owner: %s, Repo: %s)\n", 
+           repo_dir, srv_host, srv_port, current_owner, current_repo);
     return true;
 }
 
@@ -140,13 +165,14 @@ uint64_t ClientRepo::chunk_and_push(const char* filepath, uint64_t* out_size) {
         
         if (!Protocol::check_chunk(srv_host, srv_port, chunk_hash)) {
             Protocol::push_chunk(srv_host, srv_port, chunk_hash, file_data + offset, chunk_size);
+            printf("  -> Uploaded new chunk %016lx\n", chunk_hash);
         }
 
         char obj_path[2048];
         snprintf(obj_path, sizeof(obj_path), "%s/objects/%lx", repo_dir, chunk_hash);
         int obj_fd = open(obj_path, O_WRONLY | O_CREAT, 0644);
         if (obj_fd >= 0) {
-            write(obj_fd, file_data + offset, chunk_size);
+            if(write(obj_fd, file_data + offset, chunk_size)){}
             close(obj_fd);
         }
 
@@ -192,6 +218,7 @@ bool ClientRepo::commit(const char* message) {
             
             if (asset_count < 512) {
                 strncpy(assets[asset_count].filename, ent->d_name, 255);
+                assets[asset_count].filename[255] = '\0';
                 assets[asset_count].manifest_hash = file_hash;
                 assets[asset_count].file_size = f_size;
                 asset_count++;
@@ -202,22 +229,30 @@ bool ClientRepo::commit(const char* message) {
     closedir(dir);
 
     uint64_t commit_hash = CDCHasher::fnv1a_hash((uint8_t*)commit_buffer, pos);
-    Protocol::push_commit(srv_host, srv_port, commit_hash, (uint8_t*)commit_buffer, pos);
+    
+    // Check if the server actually accepted the push
+    if (!Protocol::push_commit(srv_host, srv_port, current_owner, current_repo, commit_hash, (uint8_t*)commit_buffer, pos)) {
+        printf("Error: Server rejected push (403 Forbidden). Do you have write access to %s/%s?\n", current_owner, current_repo);
+        return false;
+    }
 
     for (size_t i = 0; i < asset_count; i++) {
         AssetMetadata meta;
-        strncpy(meta.filename, assets[i].filename, 255);
+        RepositoryManager::generate_asset_id(assets[i].filename, commit_hash, meta.asset_id);
+        strncpy(meta.filename, assets[i].filename, 255); meta.filename[255] = '\0';
         strncpy(meta.mime_type, RepositoryManager::detect_mime_type(assets[i].filename), 63);
         meta.upload_time = now;
         meta.commit_hash = commit_hash;
         meta.manifest_hash = assets[i].manifest_hash;
         meta.file_size = assets[i].file_size;
+        meta.width = 0;
+        meta.height = 0;
         strncpy(meta.thumbnail_path, "pending_gen", 255);
         
         char meta_buf[1024];
         size_t m_len = RepositoryManager::serialize_asset(&meta, meta_buf, sizeof(meta_buf));
         if (m_len > 0) {
-            Protocol::push_asset_meta(srv_host, srv_port, current_repo, (const uint8_t*)meta_buf, m_len);
+            Protocol::push_asset_meta(srv_host, srv_port, current_owner, current_repo, (const uint8_t*)meta_buf, m_len);
         }
     }
 
@@ -289,7 +324,7 @@ bool ClientRepo::checkout(const char* commit_hash_str) {
                         char buf[16384];
                         ssize_t bytes_read;
                         while ((bytes_read = read(obj_fd, buf, sizeof(buf))) > 0) {
-                            write(target_fd, buf, bytes_read);
+                            if(write(target_fd, buf, bytes_read)){}
                         }
                         close(obj_fd);
                     }

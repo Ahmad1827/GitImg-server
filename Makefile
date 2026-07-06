@@ -9,7 +9,7 @@ SRC_DIR = src
 OBJ_DIR = build
 INC_DIR = include
 
-SHARED_SRCS = $(SRC_DIR)/cdc_hash.cpp $(SRC_DIR)/packfile.cpp $(SRC_DIR)/manifest.cpp $(SRC_DIR)/protocol.cpp $(SRC_DIR)/repository.cpp
+SHARED_SRCS = $(SRC_DIR)/cdc_hash.cpp $(SRC_DIR)/packfile.cpp $(SRC_DIR)/manifest.cpp $(SRC_DIR)/protocol.cpp $(SRC_DIR)/repository.cpp $(SRC_DIR)/user.cpp
 SHARED_OBJS = $(patsubst $(SRC_DIR)/%.cpp, $(OBJ_DIR)/%.o, $(SHARED_SRCS))
 
 CLIENT_SRCS = $(SRC_DIR)/client_repo.cpp $(SRC_DIR)/main_client.cpp

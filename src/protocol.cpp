@@ -9,6 +9,12 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
+char Protocol::g_auth_token[256] = {0};
+
+void Protocol::set_token(const char* token) {
+    strncpy(g_auth_token, token, 255);
+}
+
 int Protocol::connect_server(const char* host, int port) {
     struct addrinfo hints, *res;
     memset(&hints, 0, sizeof(hints));
@@ -18,20 +24,13 @@ int Protocol::connect_server(const char* host, int port) {
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
     
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-        return -1;
-    }
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) return -1;
     
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) {
-        freeaddrinfo(res);
-        return -1;
-    }
+    if (sock < 0) { freeaddrinfo(res); return -1; }
     
     if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        close(sock);
-        freeaddrinfo(res);
-        return -1;
+        close(sock); freeaddrinfo(res); return -1;
     }
     
     freeaddrinfo(res);
@@ -42,24 +41,20 @@ bool Protocol::send_http_get(const char* host, int port, const char* endpoint) {
     int sock = connect_server(host, port);
     if (sock < 0) return false;
 
-    char header[512];
+    char header[1024];
     snprintf(header, sizeof(header),
-             "GET %s HTTP/1.1\r\n"
-             "Host: %s:%d\r\n"
-             "Connection: close\r\n\r\n",
-             endpoint, host, port);
+             "GET %s HTTP/1.1\r\nHost: %s:%d\r\n"
+             "Authorization: Bearer %s\r\nConnection: close\r\n\r\n",
+             endpoint, host, port, g_auth_token);
 
-    write(sock, header, strlen(header));
-
+    if(write(sock, header, strlen(header))){}
     char response[1024];
     ssize_t bytes = read(sock, response, sizeof(response) - 1);
     close(sock);
 
     if (bytes > 0) {
         response[bytes] = '\0';
-        if (strstr(response, "200 OK") != NULL) {
-            return true;
-        }
+        if (strstr(response, "200 OK") != NULL) return true;
     }
     return false;
 }
@@ -68,14 +63,13 @@ bool Protocol::fetch_http_get(const char* host, int port, const char* endpoint, 
     int sock = connect_server(host, port);
     if (sock < 0) return false;
 
-    char header[512];
+    char header[1024];
     snprintf(header, sizeof(header),
-             "GET %s HTTP/1.1\r\n"
-             "Host: %s:%d\r\n"
-             "Connection: close\r\n\r\n",
-             endpoint, host, port);
-    write(sock, header, strlen(header));
-
+             "GET %s HTTP/1.1\r\nHost: %s:%d\r\n"
+             "Authorization: Bearer %s\r\nConnection: close\r\n\r\n",
+             endpoint, host, port, g_auth_token);
+             
+    if(write(sock, header, strlen(header))){}
     char response[8192];
     ssize_t bytes = read(sock, response, sizeof(response) - 1);
     close(sock);
@@ -97,69 +91,50 @@ bool Protocol::fetch_to_file(const char* host, int port, const char* endpoint, c
     int sock = connect_server(host, port);
     if (sock < 0) return false;
 
-    char header[512];
+    char header[1024];
     snprintf(header, sizeof(header),
-             "GET %s HTTP/1.1\r\n"
-             "Host: %s:%d\r\n"
-             "Connection: close\r\n\r\n",
-             endpoint, host, port);
-    write(sock, header, strlen(header));
-
+             "GET %s HTTP/1.1\r\nHost: %s:%d\r\n"
+             "Authorization: Bearer %s\r\nConnection: close\r\n\r\n",
+             endpoint, host, port, g_auth_token);
+             
+    if(write(sock, header, strlen(header))){}
     char buf[16384];
     ssize_t bytes = read(sock, buf, sizeof(buf));
-    if (bytes <= 0) {
-        close(sock);
-        return false;
-    }
+    if (bytes <= 0) { close(sock); return false; }
 
     char* body_start = nullptr;
     for (ssize_t i = 0; i < bytes - 3; i++) {
         if (buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n') {
-            body_start = buf + i + 4;
-            break;
+            body_start = buf + i + 4; break;
         }
     }
 
-    if (!body_start || strstr(buf, "200 OK") == NULL) {
-        close(sock);
-        return false;
-    }
+    if (!body_start || strstr(buf, "200 OK") == NULL) { close(sock); return false; }
 
     int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        close(sock);
-        return false;
-    }
+    if (fd < 0) { close(sock); return false; }
 
     ssize_t header_len = body_start - buf;
     ssize_t body_bytes = bytes - header_len;
-    if (body_bytes > 0) {
-        write(fd, body_start, body_bytes);
-    }
+    if (body_bytes > 0) { if(write(fd, body_start, body_bytes)){} }
 
-    while ((bytes = read(sock, buf, sizeof(buf))) > 0) {
-        write(fd, buf, bytes);
-    }
+    while ((bytes = read(sock, buf, sizeof(buf))) > 0) { if(write(fd, buf, bytes)){} }
 
-    close(fd);
-    close(sock);
+    close(fd); close(sock);
     return true;
 }
 
-bool Protocol::send_http_post(const char* host, int port, const char* endpoint, const uint8_t* data, size_t size) {
+bool Protocol::send_http_post(const char* host, int port, const char* endpoint, const uint8_t* data, size_t size, char* out_resp) {
     int sock = connect_server(host, port);
     if (sock < 0) return false;
 
-    char header[512];
+    char header[1024];
     snprintf(header, sizeof(header),
-             "POST %s HTTP/1.1\r\n"
-             "Host: %s:%d\r\n"
-             "Content-Length: %zu\r\n"
-             "Connection: close\r\n\r\n",
-             endpoint, host, port, size);
+             "POST %s HTTP/1.1\r\nHost: %s:%d\r\n"
+             "Authorization: Bearer %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+             endpoint, host, port, g_auth_token, size);
 
-    write(sock, header, strlen(header));
-    
+    if(write(sock, header, strlen(header))){}
     size_t total_sent = 0;
     while (total_sent < size) {
         ssize_t sent = write(sock, data + total_sent, size - total_sent);
@@ -167,63 +142,88 @@ bool Protocol::send_http_post(const char* host, int port, const char* endpoint, 
         total_sent += sent;
     }
 
-    char response[1024];
-    read(sock, response, sizeof(response) - 1);
+    char response[2048] = {0};
+    if(read(sock, response, sizeof(response) - 1)){}
     close(sock);
+    
+    if (out_resp) {
+        char* body = strstr(response, "\r\n\r\n");
+        if(body) {
+            strncpy(out_resp, body + 4, 1023);
+        }
+    }
 
-    return (total_sent == size);
+    return (total_sent == size && strstr(response, "200 OK") != NULL);
+}
+
+bool Protocol::login(const char* host, int port, const char* username, const char* password, char* out_token) {
+    char json[512];
+    snprintf(json, sizeof(json), "{\"username\":\"%s\",\"password\":\"%s\"}", username, password);
+    char resp[1024] = {0};
+    
+    if(send_http_post(host, port, "/auth/login", (const uint8_t*)json, strlen(json), resp)) {
+        char* token_start = strstr(resp, "\"token\":\"");
+        if(token_start) {
+            token_start += 9;
+            char* token_end = strchr(token_start, '"');
+            if(token_end) {
+                size_t len = token_end - token_start;
+                strncpy(out_token, token_start, len);
+                out_token[len] = '\0';
+                set_token(out_token);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool Protocol::logout(const char* host, int port) {
+    return send_http_post(host, port, "/auth/logout", (const uint8_t*)"{}", 2);
 }
 
 bool Protocol::check_chunk(const char* host, int port, uint64_t hash) {
-    char endpoint[256];
-    snprintf(endpoint, sizeof(endpoint), "/check/chunk/%lx", hash);
+    char endpoint[256]; snprintf(endpoint, sizeof(endpoint), "/check/chunk/%lx", hash);
     return send_http_get(host, port, endpoint);
 }
 
 bool Protocol::push_chunk(const char* host, int port, uint64_t hash, const uint8_t* data, size_t size) {
-    char endpoint[256];
-    snprintf(endpoint, sizeof(endpoint), "/push/chunk/%lx", hash);
+    char endpoint[256]; snprintf(endpoint, sizeof(endpoint), "/push/chunk/%lx", hash);
     return send_http_post(host, port, endpoint, data, size);
 }
 
 bool Protocol::push_manifest(const char* host, int port, uint64_t hash, const uint8_t* data, size_t size) {
-    char endpoint[256];
-    snprintf(endpoint, sizeof(endpoint), "/push/manifest/%lx", hash);
+    char endpoint[256]; snprintf(endpoint, sizeof(endpoint), "/push/manifest/%lx", hash);
     return send_http_post(host, port, endpoint, data, size);
 }
 
-bool Protocol::push_commit(const char* host, int port, uint64_t hash, const uint8_t* data, size_t size) {
-    char endpoint[256];
-    snprintf(endpoint, sizeof(endpoint), "/push/commit/%lx", hash);
+bool Protocol::push_commit(const char* host, int port, const char* owner, const char* repo_name, uint64_t hash, const uint8_t* data, size_t size) {
+    (void)hash; // Intentionally unused since it is recomputed on the server side to ensure integrity
+    char endpoint[512]; snprintf(endpoint, sizeof(endpoint), "/repo/%s/%s/push", owner, repo_name);
     return send_http_post(host, port, endpoint, data, size);
 }
 
 bool Protocol::create_repo(const char* host, int port, const char* repo_name) {
-    char endpoint[256];
-    snprintf(endpoint, sizeof(endpoint), "/repo/create/%s", repo_name);
+    char endpoint[256]; snprintf(endpoint, sizeof(endpoint), "/repo/create/%s", repo_name);
     return send_http_post(host, port, endpoint, (const uint8_t*)"", 0);
 }
 
-bool Protocol::push_asset_meta(const char* host, int port, const char* repo_name, const uint8_t* data, size_t size) {
-    char endpoint[256];
-    snprintf(endpoint, sizeof(endpoint), "/repo/asset/%s", repo_name);
+bool Protocol::push_asset_meta(const char* host, int port, const char* owner, const char* repo_name, const uint8_t* data, size_t size) {
+    char endpoint[256]; snprintf(endpoint, sizeof(endpoint), "/repo/asset/%s/%s", owner, repo_name);
     return send_http_post(host, port, endpoint, data, size);
 }
 
 bool Protocol::fetch_commit(const char* host, int port, const char* hash_str, const char* out_path) {
-    char endpoint[256];
-    snprintf(endpoint, sizeof(endpoint), "/get/commit/%s", hash_str);
+    char endpoint[256]; snprintf(endpoint, sizeof(endpoint), "/get/commit/%s", hash_str);
     return fetch_to_file(host, port, endpoint, out_path);
 }
 
 bool Protocol::fetch_manifest(const char* host, int port, uint64_t hash, const char* out_path) {
-    char endpoint[256];
-    snprintf(endpoint, sizeof(endpoint), "/get/manifest/%lx", hash);
+    char endpoint[256]; snprintf(endpoint, sizeof(endpoint), "/get/manifest/%lx", hash);
     return fetch_to_file(host, port, endpoint, out_path);
 }
 
 bool Protocol::fetch_chunk(const char* host, int port, uint64_t hash, const char* out_path) {
-    char endpoint[256];
-    snprintf(endpoint, sizeof(endpoint), "/get/chunk/%lx", hash);
+    char endpoint[256]; snprintf(endpoint, sizeof(endpoint), "/get/chunk/%lx", hash);
     return fetch_to_file(host, port, endpoint, out_path);
 }
