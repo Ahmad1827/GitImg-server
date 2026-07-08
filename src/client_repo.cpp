@@ -119,8 +119,7 @@ bool ClientRepo::init(const char* repo_target, const char* host, int port) {
         close(fd);
     }
     
-    printf("Initialized local workspace in %s\nTargeting remote %s:%d (Owner: %s, Repo: %s)\n", 
-           repo_dir, srv_host, srv_port, current_owner, current_repo);
+    printf("Initialized workspace targeting %s:%d\n", srv_host, srv_port);
     return true;
 }
 
@@ -165,7 +164,6 @@ uint64_t ClientRepo::chunk_and_push(const char* filepath, uint64_t* out_size) {
         
         if (!Protocol::check_chunk(srv_host, srv_port, chunk_hash)) {
             Protocol::push_chunk(srv_host, srv_port, chunk_hash, file_data + offset, chunk_size);
-            printf("  -> Uploaded new chunk %016lx\n", chunk_hash);
         }
 
         char obj_path[2048];
@@ -230,9 +228,7 @@ bool ClientRepo::commit(const char* message) {
 
     uint64_t commit_hash = CDCHasher::fnv1a_hash((uint8_t*)commit_buffer, pos);
     
-    // Check if the server actually accepted the push
     if (!Protocol::push_commit(srv_host, srv_port, current_owner, current_repo, commit_hash, (uint8_t*)commit_buffer, pos)) {
-        printf("Error: Server rejected push (403 Forbidden). Do you have write access to %s/%s?\n", current_owner, current_repo);
         return false;
     }
 
@@ -256,7 +252,6 @@ bool ClientRepo::commit(const char* message) {
         }
     }
 
-    printf("[master %lx] %s (Tracking %zu assets)\n", commit_hash, message, asset_count);
     return true;
 }
 
@@ -264,9 +259,7 @@ bool ClientRepo::checkout(const char* commit_hash_str) {
     char commit_path[2048];
     snprintf(commit_path, sizeof(commit_path), "%s/commits/%s.commit", repo_dir, commit_hash_str);
 
-    printf("Fetching commit metadata from %s...\n", srv_host);
     if (!Protocol::fetch_commit(srv_host, srv_port, commit_hash_str, commit_path)) {
-        printf("Failed to fetch commit %s from server.\n", commit_hash_str);
         return false;
     }
 
@@ -285,13 +278,10 @@ bool ClientRepo::checkout(const char* commit_hash_str) {
             uint64_t m_hash;
             char fname[512];
             if (sscanf(line, "%lx %511s", &m_hash, fname) == 2) {
-                printf("Reconstructing %s...\n", fname);
-
                 char manifest_path[2048];
                 snprintf(manifest_path, sizeof(manifest_path), "%s/manifests/%lx.manifest", repo_dir, m_hash);
                 
                 if (!Protocol::fetch_manifest(srv_host, srv_port, m_hash, manifest_path)) {
-                    printf("  -> Error: Could not fetch manifest for %s\n", fname);
                     continue;
                 }
 
@@ -314,7 +304,6 @@ bool ClientRepo::checkout(const char* commit_hash_str) {
                     struct stat st;
                     if (stat(obj_path, &st) == -1) {
                         if (!Protocol::fetch_chunk(srv_host, srv_port, chunk_hash, obj_path)) {
-                            printf("  -> Error: Could not fetch chunk %lx\n", chunk_hash);
                             continue;
                         }
                     }
@@ -331,12 +320,10 @@ bool ClientRepo::checkout(const char* commit_hash_str) {
                 }
                 close(target_fd);
                 close(m_fd);
-                printf("  -> Successfully restored %s\n", fname);
             }
         }
     }
     fclose(fp);
-    printf("Checkout complete.\n");
     return true;
 }
 
@@ -354,7 +341,6 @@ void ClientRepo::handle_events(int fd) {
             event = (const struct inotify_event *) ptr;
             if (event->len && (event->mask & IN_CLOSE_WRITE)) {
                 if (is_tracked_file(event->name)) {
-                    printf("Auto-sync triggered by %s\n", event->name);
                     commit("Auto-sync via watcher");
                 }
             }
@@ -368,8 +354,6 @@ void ClientRepo::watch() {
 
     watch_fd = inotify_add_watch(inotify_fd, base_dir, IN_CLOSE_WRITE);
     if (watch_fd == -1) return;
-
-    printf("GitImg watching directory: %s\n", base_dir);
 
     while (true) {
         fd_set descriptors;
