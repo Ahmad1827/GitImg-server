@@ -66,12 +66,23 @@ int main(int argc, char* argv[]) {
         }
 
         char token[256] = {0};
-        if (Protocol::login(target_host, target_port, argv[2], argv[3], token)) {
-            save_global_config(argv[2], token, target_host, target_port);
-            printf("Successfully logged into %s:%d as %s.\n", target_host, target_port, argv[2]);
-        } else {
-            printf("Login failed. Check credentials or server network connection.\n");
+        if (!Protocol::login(target_host, target_port, argv[2], argv[3], token)) {
+            if (strcmp(target_host, "127.0.0.1") != 0) {
+                printf("[Network] Connection to %s failed (IP may have changed). Auto-routing to 127.0.0.1...\n", target_host);
+                if (Protocol::login("127.0.0.1", target_port, argv[2], argv[3], token)) {
+                    strncpy(target_host, "127.0.0.1", 255);
+                } else {
+                    printf("Login failed. CRITICAL: Is your server daemon (gitimgd) running in another terminal?\n");
+                    return EXIT_FAILURE;
+                }
+            } else {
+                printf("Login failed. CRITICAL: Is your server daemon (gitimgd) running in another terminal?\n");
+                return EXIT_FAILURE;
+            }
         }
+        
+        save_global_config(argv[2], token, target_host, target_port);
+        printf("Successfully logged into %s:%d as %s.\n", target_host, target_port, argv[2]);
     }
     else if (strcmp(argv[1], "logout") == 0) {
         clear_global_config();
@@ -91,14 +102,14 @@ int main(int argc, char* argv[]) {
                 char target[256];
                 snprintf(target, sizeof(target), "%s/%s", g_username[0] ? g_username : "anonymous", folder_name);
                 
-                printf("Auto-initializing and mapping remote repository: %s on %s:%d\n", target, g_host, g_port);
+                printf("Auto-initializing remote repository: %s on %s:%d\n", target, g_host, g_port);
                 repo.init(target, g_host, g_port);
                 Protocol::create_repo(g_host, g_port, folder_name);
             }
         }
         
         if (!repo.commit(msg)) {
-            printf("Push failed. Check your network or access permissions.\n");
+            printf("Push failed. Run 'gitimg login' again to refresh your connection.\n");
         } else {
             printf("Push complete. Artwork sync successful.\n");
         }

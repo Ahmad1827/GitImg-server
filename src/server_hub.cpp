@@ -11,20 +11,28 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/time.h>
 #include <time.h>
 #include <dirent.h>
+#include <string>
+#include <vector>
+#include <sstream>
 
 static void extract_json_value(const char* json, const char* key, char* out_val) {
     out_val[0] = '\0';
-    char search_key[64]; snprintf(search_key, sizeof(search_key), "\"%s\":\"", key);
+    char search_key[64]; snprintf(search_key, sizeof(search_key), "\"%s\"", key);
     const char* start = strstr(json, search_key);
     if(start) {
         start += strlen(search_key);
-        const char* end = strchr(start, '"');
-        if(end) {
-            size_t len = end - start;
-            if(len > 255) len = 255;
-            strncpy(out_val, start, len); out_val[len] = '\0';
+        while(*start == ' ' || *start == ':' || *start == '\t') start++;
+        if (*start == '"') {
+            start++;
+            const char* end = strchr(start, '"');
+            if(end) {
+                size_t len = end - start;
+                if(len > 255) len = 255;
+                strncpy(out_val, start, len); out_val[len] = '\0';
+            }
         }
     }
 }
@@ -65,8 +73,8 @@ bool ServerHub::start() {
     struct stat st; memset(&st, 0, sizeof(struct stat));
     if (stat(base_dir, &st) == -1) mkdir(base_dir, 0755);
 
-    const char* dirs[] = {"manifests", "commits", "repos", "thumbnails", "metadata", "users", "sessions"};
-    for(int i=0; i<7; i++) {
+    const char* dirs[] = {"manifests", "commits", "repos", "thumbnails", "metadata", "users", "sessions", "activities"};
+    for(int i=0; i<8; i++) {
         char d_path[2048]; snprintf(d_path, sizeof(d_path), "%s/%s", base_dir, dirs[i]);
         if (stat(d_path, &st) == -1) mkdir(d_path, 0755);
     }
@@ -99,6 +107,71 @@ bool ServerHub::start() {
     printf(" -> Public URL mapping: %s\n", public_url);
     printf(" -> Storage Directory: %s\n", base_dir);
     return true;
+}
+
+void ServerHub::run() {
+    while (true) {
+        struct sockaddr_in client_addr; socklen_t addr_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
+        if (client_fd >= 0) handle_client(client_fd);
+    }
+}
+
+void ServerHub::log_activity(const char* user, const char* action, const char* target) {
+    char path[2048]; snprintf(path, sizeof(path), "%s/activities/global.log", base_dir);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        char line[2048];
+        snprintf(line, sizeof(line), "%ld|%s|%s|%s\n", time(NULL), user, action, target);
+        if(write(fd, line, strlen(line))){}
+        close(fd);
+    }
+}
+
+void ServerHub::generate_thumbnail(uint64_t m_hash) {
+    char m_path[2048]; snprintf(m_path, sizeof(m_path), "%s/manifests/%lx.manifest", base_dir, m_hash);
+    int m_fd = open(m_path, O_RDONLY);
+    if (m_fd < 0) return;
+    
+    char tmp_orig[1024]; snprintf(tmp_orig, sizeof(tmp_orig), "/tmp/gitimg_%lx.orig", m_hash);
+    int t_fd = open(tmp_orig, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (t_fd >= 0) {
+        uint64_t c_hash; uint8_t buf[32768]; uint32_t c_size;
+        while(read(m_fd, &c_hash, sizeof(uint64_t)) == sizeof(uint64_t)) {
+            if (pack_mgr->read_chunk(c_hash, buf, &c_size)) { if(write(t_fd, buf, c_size)){} }
+        }
+        close(t_fd);
+    }
+    close(m_fd);
+
+    char tmp_thumb[1024]; snprintf(tmp_thumb, sizeof(tmp_thumb), "/tmp/gitimg_%lx.thumb", m_hash);
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd), "convert %s -auto-orient -thumbnail 400x400^ -gravity center -extent 400x400 %s 2>/dev/null", tmp_orig, tmp_thumb);
+    int ret = system(cmd);
+    
+    char thumb_path[2048]; snprintf(thumb_path, sizeof(thumb_path), "%s/thumbnails/%lx.thumb", base_dir, m_hash);
+    
+    if (ret == 0 && access(tmp_thumb, F_OK) == 0) {
+        int src = open(tmp_thumb, O_RDONLY);
+        int dst = open(thumb_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (src >= 0 && dst >= 0) {
+            char buf[32768]; ssize_t b;
+            while((b = read(src, buf, sizeof(buf))) > 0) { if(write(dst, buf, b)){} }
+        }
+        if(src >= 0) { close(src); }
+        if(dst >= 0) { close(dst); }
+    } else {
+        int src = open(tmp_orig, O_RDONLY);
+        int dst = open(thumb_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (src >= 0 && dst >= 0) {
+            char buf[32768]; ssize_t b;
+            while((b = read(src, buf, sizeof(buf))) > 0) { if(write(dst, buf, b)){} }
+        }
+        if(src >= 0) { close(src); }
+        if(dst >= 0) { close(dst); }
+    }
+    unlink(tmp_orig); 
+    unlink(tmp_thumb);
 }
 
 bool ServerHub::check_repo_access(const char* owner, const char* repo, const char* auth_user, bool is_write) {
@@ -145,11 +218,13 @@ void ServerHub::process_post(int client_fd, const char* path, const char* auth_u
         extract_json_value((const char*)body, "password", password);
         
         if (username[0] && password[0] && UserManager::create_user(base_dir, username, email, password)) {
-            const char* resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"success\"}";
-            if(write(client_fd, resp, strlen(resp))) {}
+            char target[256]; snprintf(target, sizeof(target), "Joined the platform");
+            log_activity(username, "registered", target);
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"success\"}";
+            if(write(client_fd, resp.c_str(), resp.length())) {}
         } else {
-            const char* resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"failed\"}";
-            if(write(client_fd, resp, strlen(resp))) {}
+            std::string resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"failed\"}";
+            if(write(client_fd, resp.c_str(), resp.length())) {}
         }
     }
     else if (strcmp(path, "/auth/login") == 0 || strcmp(path, "/login") == 0) {
@@ -163,27 +238,40 @@ void ServerHub::process_post(int client_fd, const char* path, const char* auth_u
             printf("[Auth] Login Success | User: %s | Client IP: %s\n", username, real_ip);
             if(write(client_fd, resp, strlen(resp))) {}
         } else {
-            const char* resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"invalid credentials\"}";
-            printf("[Auth] Login Failed | User: %s | Client IP: %s\n", username, real_ip);
-            if(write(client_fd, resp, strlen(resp))) {}
+            UserMetadata u;
+            if (!UserManager::get_user(base_dir, username, &u)) {
+                printf("[Auth] Auto-registering new artist: %s\n", username);
+                UserManager::create_user(base_dir, username, "artist@lan.local", password);
+                char token[65]; UserManager::create_session(base_dir, username, token);
+                
+                char target[256]; snprintf(target, sizeof(target), "Joined the platform");
+                log_activity(username, "registered", target);
+                
+                char resp[512]; snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"token\":\"%s\"}", token);
+                if(write(client_fd, resp, strlen(resp))) {}
+            } else {
+                std::string resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"invalid credentials\"}";
+                printf("[Auth] Login Failed | User: %s | Client IP: %s\n", username, real_ip);
+                if(write(client_fd, resp.c_str(), resp.length())) {}
+            }
         }
     }
     else if (strcmp(path, "/auth/logout") == 0) {
-        const char* resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}";
-        if(write(client_fd, resp, strlen(resp))) {}
+        std::string resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}";
+        if(write(client_fd, resp.c_str(), resp.length())) {}
     }
     else if (strncmp(path, "/push/chunk/", 12) == 0) {
         uint64_t hash = strtoull(path + 12, NULL, 16);
         pack_mgr->append_chunk(hash, body, body_len);
-        const char* resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK";
-        if(write(client_fd, resp, strlen(resp))) {}
+        std::string resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK";
+        if(write(client_fd, resp.c_str(), resp.length())) {}
     } 
     else if (strncmp(path, "/push/manifest/", 15) == 0) {
         char m_path[2048]; snprintf(m_path, sizeof(m_path), "%s/manifests/%s.manifest", base_dir, path + 15);
         int fd = open(m_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) { if(write(fd, body, body_len)) {} close(fd); }
-        const char* resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK";
-        if(write(client_fd, resp, strlen(resp))) {}
+        std::string resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK";
+        if(write(client_fd, resp.c_str(), resp.length())) {}
     } 
     else if (strncmp(path, "/repo/", 6) == 0) {
         char owner[128]={0}, repo[128]={0}, action[128]={0};
@@ -203,15 +291,16 @@ void ServerHub::process_post(int client_fd, const char* path, const char* auth_u
                         char meta_buf[1024]; size_t mlen = RepositoryManager::serialize_repo(&r_meta, meta_buf, sizeof(meta_buf));
                         if(write(fd_r, meta_buf, mlen)) {} close(fd_r);
                     }
-                    printf("[Repo] Auto-Created: %s/%s by %s from %s\n", owner, repo, auth_user, real_ip);
+                    char target[256]; snprintf(target, sizeof(target), "%s/%s", owner, repo);
+                    log_activity(auth_user, "created repository", target);
                 } else {
-                    const char* resp = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
-                    if(write(client_fd, resp, strlen(resp))) {} return;
+                    std::string resp = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+                    if(write(client_fd, resp.c_str(), resp.length())) {} return;
                 }
             } else {
                 if (!check_repo_access(owner, repo, auth_user, true)) {
-                    const char* resp = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
-                    if(write(client_fd, resp, strlen(resp))) {} return;
+                    std::string resp = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+                    if(write(client_fd, resp.c_str(), resp.length())) {} return;
                 }
             }
             
@@ -226,15 +315,17 @@ void ServerHub::process_post(int client_fd, const char* path, const char* auth_u
                 char line[512]; snprintf(line, sizeof(line), "%lx\n", c_hash);
                 if(write(rcfd, line, strlen(line))) {} close(rcfd);
             }
-            printf("[Push] Target: %s/%s | Commit: %lx | Client IP: %s\n", owner, repo, c_hash, real_ip);
-            const char* resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK";
-            if(write(client_fd, resp, strlen(resp))) {}
+            char target[256]; snprintf(target, sizeof(target), "%s/%s", owner, repo);
+            log_activity(auth_user, "pushed a commit to", target);
+            
+            std::string resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK";
+            if(write(client_fd, resp.c_str(), resp.length())) {}
         }
         else if (strcmp(owner, "create") == 0) {
             const char* rname = repo;
             if (strlen(auth_user) == 0) {
-                const char* resp = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n";
-                if(write(client_fd, resp, strlen(resp))) {} return;
+                std::string resp = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n";
+                if(write(client_fd, resp.c_str(), resp.length())) {} return;
             }
             RepoMetadata r_meta;
             strncpy(r_meta.id, rname, 63); r_meta.id[63]='\0';
@@ -248,36 +339,97 @@ void ServerHub::process_post(int client_fd, const char* path, const char* auth_u
                 char meta_buf[1024]; size_t mlen = RepositoryManager::serialize_repo(&r_meta, meta_buf, sizeof(meta_buf));
                 if(write(fd, meta_buf, mlen)) {} close(fd);
             }
-            const char* resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK";
-            if(write(client_fd, resp, strlen(resp))) {}
+            std::string resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK";
+            if(write(client_fd, resp.c_str(), resp.length())) {}
         }
         else if (strcmp(owner, "asset") == 0) {
             char sub_owner[128]={0}, sub_repo[128]={0};
             sscanf(path, "/repo/asset/%127[^/]/%127s", sub_owner, sub_repo);
             if (!check_repo_access(sub_owner, sub_repo, auth_user, true)) {
-                const char* resp = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
-                if(write(client_fd, resp, strlen(resp))) {} return;
+                std::string resp = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+                if(write(client_fd, resp.c_str(), resp.length())) {} return;
             }
             char a_path[2048]; snprintf(a_path, sizeof(a_path), "%s/repos/%s_assets.meta", base_dir, sub_repo);
             int fd = open(a_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (fd >= 0) { if(write(fd, body, body_len)) {} close(fd); }
-            const char* resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK";
-            if(write(client_fd, resp, strlen(resp))) {}
+            
+            char body_str[8192];
+            size_t c_len = body_len < 8191 ? body_len : 8191;
+            strncpy(body_str, (const char*)body, c_len); body_str[c_len] = '\0';
+            
+            char* m_ptr = strstr(body_str, "MANIFEST: ");
+            char* f_ptr = strstr(body_str, "FILE: ");
+            if (m_ptr && f_ptr) {
+                uint64_t m_hash = 0; char fname[256]={0};
+                sscanf(m_ptr + 10, "%lx", &m_hash);
+                sscanf(f_ptr + 6, "%255[^\n]", fname);
+                generate_thumbnail(m_hash);
+                
+                char target[256]; snprintf(target, sizeof(target), "%s in %s/%s", fname, sub_owner, sub_repo);
+                log_activity(auth_user, "uploaded artwork", target);
+            }
+
+            std::string resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK";
+            if(write(client_fd, resp.c_str(), resp.length())) {}
         }
-        else {
-            const char* resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-            if(write(client_fd, resp, strlen(resp))) {}
-        }
-    }
-    else {
-        const char* resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-        if(write(client_fd, resp, strlen(resp))) {}
     }
 }
 
+std::string ServerHub::build_html_header(const std::string& title) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+    oss << "<!DOCTYPE html><html><head><title>" << title << " - GitImg</title>";
+    oss << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
+    oss << "<style>";
+    oss << "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;padding:0;}";
+    oss << "a{color:#58a6ff;text-decoration:none;} a:hover{text-decoration:underline;}";
+    oss << ".navbar{background:#161b22;padding:16px 24px;border-bottom:1px solid #30363d;display:flex;align-items:center;justify-content:space-between;}";
+    oss << ".navbar .logo{font-weight:800;font-size:22px;color:#fff;}";
+    oss << ".navbar .nav-links{display:flex;gap:20px;font-size:14px;font-weight:600;}";
+    oss << ".search-bar{background:#0d1117;border:1px solid #30363d;padding:6px 12px;border-radius:6px;color:#c9d1d9;width:250px;}";
+    oss << ".container{max-width:1280px;margin:30px auto;padding:0 20px;}";
+    oss << ".card{background:#0d1117;border:1px solid #30363d;border-radius:8px;overflow:hidden;transition:border-color 0.2s;box-shadow:0 1px 3px rgba(0,0,0,0.12);}";
+    oss << ".card:hover{border-color:#8b949e;}";
+    oss << ".btn{background:#238636;color:#ffffff;border:1px solid rgba(240,246,252,0.1);padding:5px 16px;border-radius:6px;font-weight:500;cursor:pointer;}";
+    oss << ".btn-outline{background:#21262d;border:1px solid #363b42;color:#c9d1d9;padding:5px 16px;border-radius:6px;}";
+    oss << ".stat-row{display:flex;gap:20px;border-bottom:1px solid #30363d;padding-bottom:16px;margin-bottom:24px;flex-wrap:wrap;}";
+    oss << ".stat-box{display:flex;flex-direction:column;}";
+    oss << ".stat-num{font-size:20px;font-weight:bold;color:#c9d1d9;}";
+    oss << ".stat-label{font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px;}";
+    oss << ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:20px;}";
+    oss << ".asset-card img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#010409;border-bottom:1px solid #30363d;}";
+    oss << ".asset-info{padding:16px;}";
+    oss << ".asset-info h4{margin:0 0 8px 0;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}";
+    oss << ".asset-info p{margin:4px 0;font-size:13px;color:#8b949e;}";
+    oss << ".feed-item{padding:16px 0;border-bottom:1px solid #30363d;font-size:14px;}";
+    oss << ".feed-item:last-child{border-bottom:none;}";
+    oss << ".avatar{width:100%;aspect-ratio:1/1;border-radius:50%;border:1px solid #30363d;background:#21262d;display:flex;align-items:center;justify-content:center;font-size:72px;color:#8b949e;margin-bottom:16px;}";
+    oss << ".layout-sidebar{display:flex;flex-wrap:wrap;gap:40px;}";
+    oss << ".sidebar{width:280px;flex-shrink:0;}";
+    oss << ".main-content{flex:1;min-width:300px;}";
+    oss << ".viewer-container{background:#010409;border:1px solid #30363d;border-radius:8px;padding:20px;text-align:center;margin-bottom:30px;}";
+    oss << ".viewer-container img{max-width:100%;max-height:70vh;object-fit:contain;border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,0.5);}";
+    oss << "@media (max-width: 768px){ .layout-sidebar{flex-direction:column;} .sidebar{width:100%;} .search-bar{width:150px;} }";
+    oss << "</style></head><body>";
+    oss << "<div class=\"navbar\">";
+    oss << "<a href=\"/\" class=\"logo\">GitImg</a>";
+    oss << "<div class=\"nav-links\"><form action=\"/search\" method=\"GET\"><input type=\"text\" name=\"q\" class=\"search-bar\" placeholder=\"Search artists, repos...\"></form></div>";
+    oss << "</div><div class=\"container\">";
+    return oss.str();
+}
+
+std::string ServerHub::build_html_footer() {
+    return "</div><script>document.querySelectorAll('.ts').forEach(el=>{const d=new Date(parseInt(el.innerText)*1000);el.innerText=d.toLocaleDateString()+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});});</script></body></html>";
+}
+
 void ServerHub::handle_client(int client_fd) {
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+
     req_count++;
-    
     char header_buf[8192];
     ssize_t h_bytes = read(client_fd, header_buf, sizeof(header_buf) - 1);
     if (h_bytes <= 0) { close(client_fd); return; }
@@ -287,17 +439,16 @@ void ServerHub::handle_client(int client_fd) {
     if (!body_ptr) { close(client_fd); return; }
     *body_ptr = '\0'; body_ptr += 4;
 
-    char method[16], path[512];
-    sscanf(header_buf, "%15s %511s", method, path);
+    char method[16], path[1024];
+    sscanf(header_buf, "%15s %1023s", method, path);
 
     char real_ip[64] = {0};
-    struct sockaddr_in peer;
-    socklen_t peer_len = sizeof(peer);
+    struct sockaddr_in peer; socklen_t peer_len = sizeof(peer);
     if (getpeername(client_fd, (struct sockaddr*)&peer, &peer_len) == 0) {
         strncpy(real_ip, inet_ntoa(peer.sin_addr), 63); real_ip[63]='\0';
     }
     char* xff = strcasestr(header_buf, "X-Forwarded-For: ");
-    if (xff) { sscanf(xff + 17, "%63[^ \r\n]", real_ip); }
+    if (xff) sscanf(xff + 17, "%63[^ \r\n]", real_ip);
 
     char auth_user[64] = {0};
     char* auth_hdr = strcasestr(header_buf, "Authorization: Bearer ");
@@ -310,54 +461,136 @@ void ServerHub::handle_client(int client_fd) {
 
     if (strcmp(method, "GET") == 0) {
         if (strcmp(path, "/health") == 0) {
-            const char* resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"healthy\"}";
-            if(write(client_fd, resp, strlen(resp))) {}
-        }
-        else if (strcmp(path, "/version") == 0) {
-            const char* resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"version\":\"1.0.0-lan\",\"build\":\"gitimg-core\"}";
-            if(write(client_fd, resp, strlen(resp))) {}
-        }
-        else if (strcmp(path, "/metrics") == 0) {
-            uint64_t uptime = time(NULL) - start_time;
-            char resp[512]; snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"requests\":%lu,\"uptime_sec\":%lu}", req_count, uptime);
-            if(write(client_fd, resp, strlen(resp))) {}
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"healthy\"}";
+            if(write(client_fd, resp.c_str(), resp.length())) {}
         }
         else if (strncmp(path, "/check/chunk/", 13) == 0) {
             uint64_t hash = strtoull(path + 13, NULL, 16);
             if (pack_mgr->has_chunk(hash)) {
-                const char* resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
-                if(write(client_fd, resp, strlen(resp))) {}
+                std::string resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+                if(write(client_fd, resp.c_str(), resp.length())) {}
             } else {
-                const char* resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-                if(write(client_fd, resp, strlen(resp))) {}
+                std::string resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+                if(write(client_fd, resp.c_str(), resp.length())) {}
             }
         } 
-        else if (strncmp(path, "/image/", 7) == 0 || strncmp(path, "/raw/", 5) == 0) {
+        else if (strncmp(path, "/thumb/", 7) == 0 || strncmp(path, "/raw/", 5) == 0 || strncmp(path, "/image/", 7) == 0) {
             uint64_t m_hash = 0; char filename[256] = {0};
-            if (strncmp(path, "/image/", 7) == 0) m_hash = strtoull(path + 7, NULL, 16);
+            bool is_thumb = (strncmp(path, "/thumb/", 7) == 0);
+            
+            if (is_thumb) m_hash = strtoull(path + 7, NULL, 16);
+            else if (strncmp(path, "/image/", 7) == 0) m_hash = strtoull(path + 7, NULL, 16);
             else sscanf(path, "/raw/%lx/%255s", &m_hash, filename);
             
-            char m_path[2048]; snprintf(m_path, sizeof(m_path), "%s/manifests/%lx.manifest", base_dir, m_hash);
-            int m_fd = open(m_path, O_RDONLY);
-            if (m_fd >= 0) {
-                const char* mime = (filename[0] != '\0') ? RepositoryManager::detect_mime_type(filename) : "image/jpeg";
-                char header[512]; snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nCache-Control: public, max-age=31536000, immutable\r\nConnection: close\r\n\r\n", mime);
-                if(write(client_fd, header, strlen(header))) {}
-
-                uint64_t chunk_hash; uint8_t buffer[32768]; uint32_t out_size;
-                while (read(m_fd, &chunk_hash, sizeof(uint64_t)) == sizeof(uint64_t)) {
-                    if (pack_mgr->read_chunk(chunk_hash, buffer, &out_size)) {
-                        if(write(client_fd, buffer, out_size)) {}
-                    }
+            if (is_thumb) {
+                char thumb_path[2048]; snprintf(thumb_path, sizeof(thumb_path), "%s/thumbnails/%lx.thumb", base_dir, m_hash);
+                int fd = open(thumb_path, O_RDONLY);
+                if (fd >= 0) {
+                    std::string header = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nCache-Control: public, max-age=31536000, immutable\r\nConnection: close\r\n\r\n";
+                    if(write(client_fd, header.c_str(), header.length())) {}
+                    char buf[32768]; ssize_t b;
+                    while((b = read(fd, buf, sizeof(buf))) > 0) { if(write(client_fd, buf, b)){} }
+                    close(fd);
+                } else {
+                    is_thumb = false; 
                 }
-                close(m_fd);
-            } else {
-                const char* resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-                if(write(client_fd, resp, strlen(resp))) {}
+            }
+            
+            if (!is_thumb) {
+                char m_path[2048]; snprintf(m_path, sizeof(m_path), "%s/manifests/%lx.manifest", base_dir, m_hash);
+                int m_fd = open(m_path, O_RDONLY);
+                if (m_fd >= 0) {
+                    const char* mime = (filename[0] != '\0') ? RepositoryManager::detect_mime_type(filename) : "image/jpeg";
+                    char header[512]; snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nCache-Control: public, max-age=31536000, immutable\r\nConnection: close\r\n\r\n", mime);
+                    if(write(client_fd, header, strlen(header))) {}
+
+                    uint64_t chunk_hash; uint8_t buffer[32768]; uint32_t out_size;
+                    while (read(m_fd, &chunk_hash, sizeof(uint64_t)) == sizeof(uint64_t)) {
+                        if (pack_mgr->read_chunk(chunk_hash, buffer, &out_size)) {
+                            if(write(client_fd, buffer, out_size)) {}
+                        }
+                    }
+                    close(m_fd);
+                } else {
+                    std::string resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+                    if(write(client_fd, resp.c_str(), resp.length())) {}
+                }
             }
         }
+        else if (strcmp(path, "/") == 0) {
+            std::string html = build_html_header("Home");
+            html += "<h2>Recent Activity</h2><div style=\"background:#161b22;border:1px solid #30363d;border-radius:8px;padding:0 20px;\">";
+            
+            char a_path[2048]; snprintf(a_path, sizeof(a_path), "%s/activities/global.log", base_dir);
+            int fd = open(a_path, O_RDONLY);
+            if (fd >= 0) {
+                struct stat st; 
+                if (fstat(fd, &st) == 0 && st.st_size > 0) {
+                    char* buf = (char*)malloc((size_t)st.st_size + 1);
+                    ssize_t rb = read(fd, buf, (size_t)st.st_size);
+                    if (rb >= 0) {
+                        buf[rb] = '\0';
+                        std::vector<std::string> lines;
+                        char* line = strtok(buf, "\n");
+                        while(line) { lines.push_back(line); line = strtok(NULL, "\n"); }
+                        int start_idx = lines.size() > 10 ? lines.size() - 10 : 0;
+                        for(int i = lines.size() - 1; i >= start_idx; i--) {
+                            char ts[64]={0}, user[64]={0}, act[64]={0}, tgt[256]={0};
+                            sscanf(lines[i].c_str(), "%63[^|]|%63[^|]|%63[^|]|%255[^\n]", ts, user, act, tgt);
+                            html += "<div class=\"feed-item\"><strong><a href=\"/" + std::string(user) + "\">" + user + "</a></strong> " + act + " <em>" + tgt + "</em> <span style=\"color:#8b949e;float:right;\" class=\"ts\">" + ts + "</span></div>";
+                        }
+                    }
+                    free(buf);
+                }
+                close(fd);
+            } else {
+                html += "<div class=\"feed-item\">Welcome to GitImg! No activity yet.</div>";
+            }
+            html += "</div>" + build_html_footer();
+            if(write(client_fd, html.c_str(), html.length())) {}
+        }
+        else if (strncmp(path, "/search", 7) == 0) {
+            char query[256] = {0};
+            const char* q_ptr = strstr(path, "?q=");
+            if (q_ptr) { sscanf(q_ptr + 3, "%255s", query); }
+            
+            std::string html = build_html_header("Search Results");
+            html += "<h2>Search Results for '" + std::string(query) + "'</h2><div class=\"grid\">";
+            
+            DIR* dir; struct dirent* ent;
+            char repos_dir[2048]; snprintf(repos_dir, sizeof(repos_dir), "%s/repos", base_dir);
+            if ((dir = opendir(repos_dir)) != NULL) {
+                while ((ent = readdir(dir)) != NULL) {
+                    if (strstr(ent->d_name, ".repo")) {
+                        char rp[4096]; snprintf(rp, sizeof(rp), "%s/%s", repos_dir, ent->d_name);
+                        int fd = open(rp, O_RDONLY);
+                        if (fd >= 0) {
+                            struct stat st; 
+                            if (fstat(fd, &st) == 0 && st.st_size > 0) {
+                                char* buf = (char*)malloc((size_t)st.st_size+1);
+                                ssize_t rb = read(fd, buf, (size_t)st.st_size);
+                                if(rb >= 0) {
+                                    buf[rb]='\0';
+                                    if (strlen(query) == 0 || strcasestr(buf, query)) {
+                                        char rname[128]={0}, rowner[128]={0};
+                                        char* np = strstr(buf, "NAME: "); if(np) sscanf(np+6, "%127[^\n]", rname);
+                                        char* op = strstr(buf, "OWNER: "); if(op) sscanf(op+7, "%127[^\n]", rowner);
+                                        html += "<div class=\"card asset-info\"><h4><a href=\"/" + std::string(rowner) + "/" + std::string(rname) + "\">" + rname + "</a></h4><p>Owned by " + rowner + "</p></div>";
+                                    }
+                                }
+                                free(buf);
+                            }
+                            close(fd);
+                        }
+                    }
+                }
+                closedir(dir);
+            }
+            html += "</div>" + build_html_footer();
+            if(write(client_fd, html.c_str(), html.length())) {}
+        }
         else {
-            char p1[128]={0}, p2[128]={0}, p3[128]={0};
+            char p1[128]={0}, p2[128]={0}, p3[128]={0}, p4[128]={0};
             const char* p = path; if (p[0] == '/') p++;
             const char* s1 = strchr(p, '/');
             if (s1) {
@@ -366,81 +599,61 @@ void ServerHub::handle_client(int client_fd) {
                 const char* s2 = strchr(p_next, '/');
                 if (s2) { 
                     strncpy(p2, p_next, s2 - p_next); p2[s2-p_next]='\0';
-                    strcpy(p3, s2 + 1); 
-                } 
-                else { strcpy(p2, p_next); }
+                    const char* p_next2 = s2 + 1;
+                    const char* s3 = strchr(p_next2, '/');
+                    if(s3) {
+                        strncpy(p3, p_next2, s3 - p_next2); p3[s3-p_next2]='\0';
+                        strcpy(p4, s3 + 1);
+                    } else {
+                        strcpy(p3, p_next2);
+                    }
+                } else { strcpy(p2, p_next); }
             } else { strcpy(p1, p); }
 
-            if (strlen(p1) > 0 && strlen(p2) > 0) {
+            if (strlen(p1) > 0 && strlen(p2) > 0 && strcmp(p3, "asset") == 0 && strlen(p4) > 0) {
+                std::string html = build_html_header("Asset Viewer");
+                html += "<div style=\"margin-bottom:20px;\"><a href=\"/" + std::string(p1) + "/" + std::string(p2) + "\" class=\"btn-outline\">&larr; Back to Repository</a></div>";
+                html += "<div class=\"viewer-container\"><img src=\"/raw/" + std::string(p4) + "/image.png\" alt=\"Asset\"></div>";
+                html += "<div class=\"card asset-info\"><h2>Asset Details</h2><p>Manifest Hash: <span style=\"font-family:monospace;\">" + std::string(p4) + "</span></p></div>";
+                html += build_html_footer();
+                if(write(client_fd, html.c_str(), html.length())) {}
+            }
+            else if (strlen(p1) > 0 && strlen(p2) > 0) {
                 if (!check_repo_access(p1, p2, auth_user, false)) {
-                    const char* resp = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
-                    if(write(client_fd, resp, strlen(resp))) {} return;
+                    std::string resp = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+                    if(write(client_fd, resp.c_str(), resp.length())) {} return;
                 }
                 
-                if (strcmp(p3, "pull") == 0) {
-                    const char* resp = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\":\"pull_ready\"}";
-                    if(write(client_fd, resp, strlen(resp))) {} return;
-                }
-                
-                char latest_commit[256] = {0};
-                int commit_count = 0;
+                int commit_count = 0; uint64_t total_size = 0; int asset_count = 0;
                 char c_path[2048]; snprintf(c_path, sizeof(c_path), "%s/repos/%s_commits.meta", base_dir, p2);
+                
+                std::string timeline_html = "";
                 int cfd = open(c_path, O_RDONLY);
                 if (cfd >= 0) {
                     struct stat cst; 
                     if (fstat(cfd, &cst) == 0 && cst.st_size > 0) {
                         char* cbuf = (char*)malloc((size_t)cst.st_size + 1);
                         ssize_t rb = read(cfd, cbuf, (size_t)cst.st_size);
-                        if(rb >= 0) {
+                        if (rb >= 0) {
                             cbuf[rb] = '\0';
                             char* cline = strtok(cbuf, "\n");
-                            while(cline) { strncpy(latest_commit, cline, 255); commit_count++; cline = strtok(NULL, "\n"); }
+                            std::vector<std::string> rev_commits;
+                            while(cline) { rev_commits.push_back(cline); commit_count++; cline = strtok(NULL, "\n"); }
+                            for(int i = rev_commits.size()-1; i>=0; i--) {
+                                timeline_html += "<div class=\"feed-item\">commit <strong style=\"font-family:monospace;\">" + rev_commits[i] + "</strong></div>";
+                            }
                         }
                         free(cbuf);
                     }
                     close(cfd);
+                } else {
+                    timeline_html = "<div class=\"feed-item\">No activity yet.</div>";
                 }
 
-                char header[8192];
-                snprintf(header, sizeof(header), 
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
-                    "<!DOCTYPE html><html><head><title>%s/%s - GitImg LAN</title>"
-                    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
-                    "<style>"
-                    "body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;padding:0;}"
-                    ".navbar{background:#161b22;padding:16px 20px;border-bottom:1px solid #30363d;display:flex;align-items:center;}"
-                    ".navbar .logo{font-weight:bold;font-size:20px;color:#fff;text-decoration:none;}"
-                    ".container{max-width:1200px;margin:30px auto;padding:0 20px;}"
-                    ".header{border-bottom:1px solid #30363d;padding-bottom:20px;margin-bottom:20px;}"
-                    ".header h1{margin:0 0 10px 0;font-size:24px;font-weight:600;}"
-                    ".header h1 a{color:#58a6ff;text-decoration:none;}"
-                    ".stats{font-size:14px;color:#8b949e;display:flex;gap:20px;}"
-                    ".layout{display:flex;flex-wrap:wrap;gap:30px;}"
-                    ".main{flex:3;min-width:300px;}"
-                    ".sidebar{flex:1;min-width:250px;background:#161b22;padding:20px;border-radius:8px;border:1px solid #30363d;height:fit-content;}"
-                    ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;}"
-                    ".card{background:#010409;border:1px solid #30363d;border-radius:6px;overflow:hidden;}"
-                    ".card:hover{border-color:#8b949e;}"
-                    ".card img{width:100%%;height:160px;object-fit:cover;display:block;background:#000;}"
-                    ".card-info{padding:12px;}"
-                    ".card-info strong{display:block;margin-bottom:6px;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
-                    ".card-info strong a{color:#c9d1d9;text-decoration:none;}"
-                    ".card-info strong a:hover{color:#58a6ff;}"
-                    ".card-info span{font-size:12px;color:#8b949e;line-height:1.4;display:block;}"
-                    "h2{margin-top:0;font-size:16px;border-bottom:1px solid #30363d;padding-bottom:10px;}"
-                    ".commit{padding:10px 0;border-bottom:1px solid #30363d;font-family:monospace;font-size:13px;word-break:break-all;}"
-                    ".commit:last-child{border-bottom:none;padding-bottom:0;}"
-                    ".commit strong{color:#58a6ff;}"
-                    "</style></head><body>"
-                    "<div class=\"navbar\"><a href=\"/\" class=\"logo\">GitImg Studio</a></div>"
-                    "<div class=\"container\">"
-                    "<div class=\"header\">"
-                    "<h1><a href=\"/%s\">%s</a> / <a href=\"/%s/%s\"><b>%s</b></a></h1>"
-                    "<div class=\"stats\"><span>%d Commits</span></div>"
-                    "</div><div class=\"layout\"><div class=\"main\"><h2>Assets Gallery</h2><div class=\"grid\">",
-                    p1, p2, p1, p1, p1, p1, p2, p2, commit_count);
-                if(write(client_fd, header, strlen(header))) {}
-
+                std::string html = build_html_header(std::string(p1) + "/" + std::string(p2));
+                html += "<div style=\"margin-bottom:24px;\"><h1 style=\"margin:0;\"><a href=\"/" + std::string(p1) + "\">" + std::string(p1) + "</a> / <b>" + std::string(p2) + "</b></h1></div>";
+                
+                std::string gallery_html = "<div class=\"grid\">";
                 char a_path[2048]; snprintf(a_path, sizeof(a_path), "%s/repos/%s_assets.meta", base_dir, p2);
                 int afd = open(a_path, O_RDONLY);
                 if (afd >= 0) {
@@ -451,25 +664,24 @@ void ServerHub::handle_client(int client_fd) {
                         if(rb >= 0) {
                             abuf[rb] = '\0';
                             char* aline = strtok(abuf, "\n");
-                            char c_file[256]={0}, c_man[256]={0}, c_size[256]={0}, c_commit[256]={0}, c_time[256]={0};
+                            char c_file[256]={0}, c_man[256]={0}, c_size[256]={0}, c_time[256]={0};
                             while(aline) {
                                 if (strncmp(aline, "FILE: ", 6) == 0) strncpy(c_file, aline+6, 255);
-                                else if (strncmp(aline, "COMMIT: ", 8) == 0) strncpy(c_commit, aline+8, 255);
                                 else if (strncmp(aline, "MANIFEST: ", 10) == 0) strncpy(c_man, aline+10, 255);
-                                else if (strncmp(aline, "SIZE: ", 6) == 0) strncpy(c_size, aline+6, 255);
+                                else if (strncmp(aline, "SIZE: ", 6) == 0) { strncpy(c_size, aline+6, 255); total_size += atoll(c_size); }
                                 else if (strncmp(aline, "TIME: ", 6) == 0) strncpy(c_time, aline+6, 255);
                                 else if (strncmp(aline, "HEIGHT: ", 8) == 0) {
-                                    if (c_file[0] != '\0' && strcmp(c_commit, latest_commit) == 0) {
-                                        char card[2048];
-                                        snprintf(card, sizeof(card),
-                                            "<div class=\"card\">"
-                                            "<a href=\"/raw/%s/%s\"><img src=\"/image/%s\" alt=\"%s\" loading=\"lazy\"></a>"
-                                            "<div class=\"card-info\">"
-                                            "<strong><a href=\"/raw/%s/%s\">%s</a></strong>"
-                                            "<span>Size: %s bytes<br>Uploaded: <span class=\"ts\">%s</span></span>"
-                                            "</div></div>", c_man, c_file, c_man, c_file, c_man, c_file, c_file, c_size, c_time);
-                                        if(write(client_fd, card, strlen(card))) {}
-                                        c_file[0] = '\0';
+                                    if (c_file[0] != '\0') {
+                                        asset_count++;
+                                        gallery_html += "<div class=\"card asset-card\">";
+                                        gallery_html += "<a href=\"/" + std::string(p1) + "/" + std::string(p2) + "/asset/" + c_man + "\">";
+                                        gallery_html += "<img src=\"/thumb/" + std::string(c_man) + "\" alt=\"Thumbnail\" loading=\"lazy\"></a>";
+                                        gallery_html += "<div class=\"asset-info\"><h4><a href=\"/" + std::string(p1) + "/" + std::string(p2) + "/asset/" + c_man + "\">" + c_file + "</a></h4>";
+                                        double mb = atoll(c_size) / 1048576.0;
+                                        char size_fmt[32]; snprintf(size_fmt, sizeof(size_fmt), "%.2f MB", mb);
+                                        gallery_html += "<p>" + std::string(size_fmt) + " &bull; <span class=\"ts\">" + c_time + "</span></p>";
+                                        gallery_html += "</div></div>";
+                                        c_file[0] = '\0'; 
                                     }
                                 }
                                 aline = strtok(NULL, "\n");
@@ -479,54 +691,40 @@ void ServerHub::handle_client(int client_fd) {
                     }
                     close(afd);
                 }
+                gallery_html += "</div>";
 
-                const char* mid = "</div></div><div class=\"sidebar\"><h2>Timeline</h2><div class=\"commit-feed\">";
-                if(write(client_fd, mid, strlen(mid))) {}
+                html += "<div class=\"stat-row\">";
+                html += "<div class=\"stat-box\"><span class=\"stat-num\">" + std::to_string(commit_count) + "</span><span class=\"stat-label\">Commits</span></div>";
+                html += "<div class=\"stat-box\"><span class=\"stat-num\">" + std::to_string(asset_count) + "</span><span class=\"stat-label\">Assets</span></div>";
+                char sz[64]; snprintf(sz, sizeof(sz), "%.2f MB", total_size / 1048576.0);
+                html += "<div class=\"stat-box\"><span class=\"stat-num\">" + std::string(sz) + "</span><span class=\"stat-label\">Raw Storage</span></div>";
+                html += "</div>";
 
-                cfd = open(c_path, O_RDONLY);
-                if (cfd >= 0) {
-                    struct stat cst; 
-                    if (fstat(cfd, &cst) == 0 && cst.st_size > 0) {
-                        char* cbuf = (char*)malloc((size_t)cst.st_size + 1);
-                        ssize_t rb = read(cfd, cbuf, (size_t)cst.st_size);
-                        if (rb >= 0) {
-                            cbuf[rb] = '\0';
-                            char* cline = strtok(cbuf, "\n");
-                            while(cline) {
-                                char cdiv[512]; snprintf(cdiv, sizeof(cdiv), "<div class=\"commit\">commit <strong>%s</strong></div>", cline);
-                                if(write(client_fd, cdiv, strlen(cdiv))) {}
-                                cline = strtok(NULL, "\n");
-                            }
-                        }
-                        free(cbuf);
-                    }
-                    close(cfd);
-                } else {
-                    const char* no_com = "<div class=\"commit\">No activity yet.</div>";
-                    if(write(client_fd, no_com, strlen(no_com))) {}
-                }
+                html += "<div class=\"layout-sidebar\"><div class=\"main-content\"><h2>Gallery</h2>" + gallery_html + "</div>";
+                html += "<div class=\"sidebar\"><div class=\"card\" style=\"padding:0 16px;\"><h2 style=\"padding-top:16px;\">Timeline</h2>" + timeline_html + "</div></div></div>";
+                html += build_html_footer();
 
-                const char* footer = "</div></div></div></div><script>"
-                                     "document.querySelectorAll('.ts').forEach(el => {"
-                                     "const d = new Date(parseInt(el.innerText) * 1000);"
-                                     "el.innerText = d.toLocaleDateString() + ' ' + d.toLocaleTimeString();"
-                                     "});</script></body></html>";
-                if(write(client_fd, footer, strlen(footer))) {}
+                if(write(client_fd, html.c_str(), html.length())) {}
             } else if (strlen(p1) > 0 && strlen(p2) == 0) {
                 UserMetadata u;
                 if (UserManager::get_user(base_dir, p1, &u)) {
-                    int total_repos = 0;
-                    char repo_list_html[8192] = {0};
-                    
-                    DIR* dir;
-                    struct dirent* ent;
-                    char repos_dir[2048];
-                    snprintf(repos_dir, sizeof(repos_dir), "%s/repos", base_dir);
+                    std::string html = build_html_header(std::string(p1));
+                    html += "<div class=\"layout-sidebar\"><div class=\"sidebar\">";
+                    char initial = u.username[0] >= 'a' ? u.username[0] - 32 : u.username[0];
+                    html += "<div class=\"avatar\">" + std::string(1, initial) + "</div>";
+                    html += "<h1 style=\"margin:0;\">" + std::string(u.username) + "</h1>";
+                    html += "<p style=\"color:#8b949e;margin-top:4px;\">GitImg Artist</p>";
+                    html += "<button class=\"btn\" style=\"width:100%;margin-top:16px;\">Follow</button>";
+                    html += "</div><div class=\"main-content\">";
+                    html += "<h2 style=\"border-bottom:1px solid #30363d;padding-bottom:10px;\">Public Portfolios</h2>";
+                    html += "<div class=\"grid\">";
+
+                    DIR* dir; struct dirent* ent;
+                    char repos_dir[2048]; snprintf(repos_dir, sizeof(repos_dir), "%s/repos", base_dir);
                     if ((dir = opendir(repos_dir)) != NULL) {
                         while ((ent = readdir(dir)) != NULL) {
                             if (strstr(ent->d_name, ".repo")) {
-                                char rp[4096];
-                                snprintf(rp, sizeof(rp), "%s/%s", repos_dir, ent->d_name);
+                                char rp[4096]; snprintf(rp, sizeof(rp), "%s/%s", repos_dir, ent->d_name);
                                 int fd = open(rp, O_RDONLY);
                                 if (fd >= 0) {
                                     struct stat st; 
@@ -539,33 +737,8 @@ void ServerHub::handle_client(int client_fd) {
                                             if (strstr(buf, o_check)) {
                                                 char* name_pos = strstr(buf, "NAME: ");
                                                 if(name_pos) {
-                                                    char rname[128];
-                                                    sscanf(name_pos + 6, "%127[^\n]", rname);
-                                                    
-                                                    int rc = 0;
-                                                    char rc_path[2048]; snprintf(rc_path, sizeof(rc_path), "%s/repos/%s_commits.meta", base_dir, rname);
-                                                    int rcfd = open(rc_path, O_RDONLY);
-                                                    if (rcfd >= 0) {
-                                                        struct stat rcst; 
-                                                        if (fstat(rcfd, &rcst) == 0 && rcst.st_size > 0) {
-                                                            char* rcbuf = (char*)malloc((size_t)rcst.st_size+1);
-                                                            ssize_t rcb = read(rcfd, rcbuf, (size_t)rcst.st_size);
-                                                            if (rcb >= 0) {
-                                                                rcbuf[rcb]='\0';
-                                                                for(off_t i=0; i<rcst.st_size; i++) if(rcbuf[i]=='\n') rc++;
-                                                            }
-                                                            free(rcbuf);
-                                                        }
-                                                        close(rcfd);
-                                                    }
-
-                                                    char card[512];
-                                                    snprintf(card, sizeof(card), 
-                                                        "<div class=\"repo-card\"><h3><a href=\"/%s/%s\">%s</a></h3>"
-                                                        "<span style=\"color:#8b949e;font-size:12px;\">%d Commits</span></div>", 
-                                                        u.username, rname, rname, rc);
-                                                    strncat(repo_list_html, card, sizeof(repo_list_html) - strlen(repo_list_html) - 1);
-                                                    total_repos++;
+                                                    char rname[128]; sscanf(name_pos + 6, "%127[^\n]", rname);
+                                                    html += "<div class=\"card\" style=\"padding:20px;\"><h3><a href=\"/" + std::string(u.username) + "/" + std::string(rname) + "\">" + std::string(rname) + "</a></h3><p style=\"color:#8b949e;font-size:14px;margin-bottom:0;\">Public artwork repository</p></div>";
                                                 }
                                             }
                                         }
@@ -577,92 +750,22 @@ void ServerHub::handle_client(int client_fd) {
                         }
                         closedir(dir);
                     }
-
-                    char header[8192];
-                    snprintf(header, sizeof(header), 
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
-                        "<!DOCTYPE html><html><head><title>%s - GitImg LAN</title>"
-                        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
-                        "<style>body{font-family:-apple-system,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;}"
-                        ".navbar{background:#161b22;padding:16px 20px;border-bottom:1px solid #30363d;}"
-                        ".navbar .logo{font-weight:bold;font-size:20px;color:#fff;text-decoration:none;}"
-                        ".container{max-width:1000px;margin:30px auto;display:flex;flex-wrap:wrap;gap:40px;padding:0 20px;}"
-                        ".sidebar{width:280px;min-width:250px;}"
-                        ".avatar{width:100%%;aspect-ratio:1/1;border-radius:50%%;border:1px solid #30363d;background:#21262d;margin-bottom:16px;display:flex;align-items:center;justify-content:center;font-size:64px;color:#8b949e;}"
-                        ".username{font-size:24px;font-weight:600;color:#c9d1d9;margin-bottom:4px;}"
-                        ".stats{display:flex;gap:16px;margin-top:16px;border-top:1px solid #30363d;padding-top:16px;}"
-                        ".stat-box{display:flex;flex-direction:column;}"
-                        ".stat-num{font-size:20px;font-weight:bold;color:#c9d1d9;}"
-                        ".stat-label{font-size:12px;color:#8b949e;}"
-                        ".main{flex:1;min-width:300px;}"
-                        ".repo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px;}"
-                        ".repo-card{border:1px solid #30363d;padding:16px;border-radius:6px;background:#0d1117;}"
-                        ".repo-card h3{margin:0 0 8px 0;}"
-                        ".repo-card a{color:#58a6ff;text-decoration:none;font-size:18px;font-weight:600;}"
-                        "</style></head><body>"
-                        "<div class=\"navbar\"><a href=\"/\" class=\"logo\">GitImg Studio</a></div>"
-                        "<div class=\"container\"><div class=\"sidebar\">"
-                        "<div class=\"avatar\">%c</div>"
-                        "<div class=\"username\">%s</div>"
-                        "<div class=\"stats\">"
-                        "<div class=\"stat-box\"><span class=\"stat-num\">%d</span><span class=\"stat-label\">Repositories</span></div>"
-                        "</div></div><div class=\"main\">"
-                        "<h2 style=\"border-bottom:1px solid #30363d;padding-bottom:8px;margin-top:0;\">Artwork Portfolios</h2>"
-                        "<div class=\"repo-grid\">", u.username, u.username[0] >= 'a' ? u.username[0] - 32 : u.username[0], u.username, total_repos);
-                    
-                    if(write(client_fd, header, strlen(header))) {}
-                    if(write(client_fd, repo_list_html, strlen(repo_list_html))) {}
-                    if(write(client_fd, "</div></div></div></body></html>", 32)) {}
-
+                    html += "</div></div></div>" + build_html_footer();
+                    if(write(client_fd, html.c_str(), html.length())) {}
                 } else {
-                    const char* resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-                    if(write(client_fd, resp, strlen(resp))) {}
+                    std::string resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+                    if(write(client_fd, resp.c_str(), resp.length())) {}
                 }
             } else {
-                const char* resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-                if(write(client_fd, resp, strlen(resp))) {}
+                std::string resp = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+                if(write(client_fd, resp.c_str(), resp.length())) {}
             }
         }
         close(client_fd);
         return;
     }
 
-    if (strcmp(method, "POST") != 0) {
-        const char* bad = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
-        if(write(client_fd, bad, strlen(bad))) {} close(client_fd); return;
-    }
-
-    size_t content_length = 0;
-    char* cl_hdr = strcasestr(header_buf, "Content-Length:");
-    if (cl_hdr) sscanf(cl_hdr + 15, "%zu", &content_length);
-
-    uint8_t* body = nullptr; size_t total_read = 0;
-    
-    if (content_length > 0) {
-        body = (uint8_t*)malloc(content_length + 1);
-        size_t header_body_len = h_bytes - (body_ptr - header_buf);
-        if (header_body_len > 0) {
-            size_t copy_len = (header_body_len < content_length) ? header_body_len : content_length;
-            memcpy(body, body_ptr, copy_len); total_read = copy_len;
-        }
-        while (total_read < content_length) {
-            ssize_t r = read(client_fd, body + total_read, content_length - total_read);
-            if (r <= 0) { break; } 
-            total_read += r;
-        }
-        body[total_read] = '\0';
-    }
-
-    process_post(client_fd, path, auth_user, body, total_read, real_ip);
-    
-    if (body) free(body);
+    std::string resp = "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n";
+    if(write(client_fd, resp.c_str(), resp.length())) {}
     close(client_fd);
-}
-
-void ServerHub::run() {
-    while (true) {
-        struct sockaddr_in client_addr; socklen_t addr_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
-        if (client_fd >= 0) handle_client(client_fd);
-    }
 }

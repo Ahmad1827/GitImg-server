@@ -26,6 +26,25 @@ struct RepoMetadata {
     char collaborators[512]; // comma separated
 };
 
+// Prepared Metadata Structures for Future Scale
+struct CommentMeta {
+    uint64_t comment_id;
+    char user[64];
+    char text[1024];
+    uint64_t timestamp;
+};
+
+struct LikeMeta {
+    char user[64];
+    uint64_t timestamp;
+};
+
+struct FollowMeta {
+    char follower[64];
+    char target[64];
+    uint64_t timestamp;
+};
+
 class RepositoryManager {
 public:
     static const char* detect_mime_type(const char* filename);

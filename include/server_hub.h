@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string>
 #include "packfile.h"
 
 class ServerHub {
@@ -27,6 +28,13 @@ private:
 
     void load_config(const char* config_path);
     bool check_repo_access(const char* owner, const char* repo, const char* auth_user, bool is_write);
+    
+    void log_activity(const char* user, const char* action, const char* target);
+    void generate_thumbnail(uint64_t manifest_hash);
+    
+    std::string build_html_header(const std::string& title);
+    std::string build_html_footer();
+    
     void handle_client(int client_fd);
     void process_post(int client_fd, const char* path, const char* auth_user, const uint8_t* body, size_t body_len, const char* real_ip);
 };
