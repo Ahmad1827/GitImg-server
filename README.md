@@ -1,162 +1,58 @@
 # GitImg
 
-A custom, high-performance version control system tailored for artists and binary asset management.
-
-GitImg leverages **FastCDC (Content-Defined Chunking)** and **FNV-1a hashing** to provide efficient deduplication and storage for large binary files.
-
----
+A custom, high-performance version control system tailored for artists and binary asset management. GitImg leverages FastCDC (Content-Defined Chunking) and FNV-1a hashing to provide efficient deduplication and storage for large binary files over your local network.
 
 ## Architecture
 
-GitImg is built using **pure C++17** with **zero external dependencies**, utilizing POSIX/Linux APIs for low-level system interaction.
+GitImg is built on pure C++17 with zero external dependencies, utilizing POSIX/Linux native APIs for low-level system interaction.
 
-### Client (`gitimg`)
-
-Performs client-side chunking and pushes only unique data to the server.
-
-### Server (`gitimgd`)
-
-A raw socket daemon responsible for:
-
-* Append-only packfile storage
-* Metadata management
-* User authentication
-* Repository handling
-* Asset reconstruction
-
-### Web Interface
-
-An embedded HTTP dashboard dynamically reconstructs assets directly from packfile chunks and renders them in a dark-mode, GitHub-inspired interface.
-
-Example preview:
-
-```text
-http://localhost:8080/ahmad/WisdomArt
-```
-
----
+* **Client (gitimg)**: Performs client-side chunking and pushes only unique data to the server. Now supports LAN-based discovery and persistent remote configuration.
+* **Server (gitimgd)**: A multi-client TCP socket daemon that handles append-only packfile storage, session-based authentication, and dynamic image reconstruction.
+* **Web Interface**: An embedded HTTP dashboard that dynamically renders your repository's gallery and commit history in a dark-mode, GitHub-inspired interface.
 
 ## Core Features
 
-### Network Deduplication
-
-Only new or modified binary segments are transferred to the server.
-
-Benefits:
-
-* Reduced bandwidth usage
-* Faster uploads
-* Efficient storage utilization
-
----
-
-### Identity & Security
-
-Integrated authentication system including:
-
-* User registration
-* Login system
-* Session-based token authentication
-* Repository permissions
-
----
-
-### Repository Management
-
-Supports ownership and access control:
-
-* Public repositories
-* Private repositories
-* Repository owners
-* Collaborator permissions
-
----
-
-### Artist-Focused Interface
-
-GitHub-inspired workflow designed specifically for artists:
-
-* Gallery-style asset browsing
-* Commit history feed
-* Image previews
-* Version tracking
-
----
+* **LAN-Ready**: Server configuration allows binding to `0.0.0.0`, enabling multi-device access across your home network.
+* **Network Deduplication**: Only new or changed binary chunks are pushed to the server, maximizing performance over Wi-Fi.
+* **Identity & Security**: Integrated user registration, login, and session-based token authentication with 403 Forbidden access control.
+* **Zero-Config Workflow**: Automatic repository creation and asset mapping on the first `push`.
+* **Responsive Web UI**: Built-in gallery grid that works on mobile, tablet, and desktop browsers.
 
 ## Quick Start
 
 ### 1. Compile
 
-```bash
-make clean && make
-```
+    make clean && make
 
-### 2. Run Server
+### 2. Configure and Run Server
 
-```bash
-./gitimgd
-```
+Create a `server.conf` file:
 
-### 3. Authentication & Usage
+    BIND_HOST=0.0.0.0
+    PORT=8080
+    STORAGE_DIR=.gitimgd
 
-Register/Login:
+Run the daemon:
 
-```bash
-gitimg login <username> <password>
-```
+    ./gitimgd server.conf
 
-Clone a remote repository:
+### 3. Usage on LAN
 
-```bash
-gitimg clone <owner>/<repo_name>
-```
+On any device connected to your network, initialize and push your art:
 
-Push changes:
+    # Log in to your desktop server's IP
+    gitimg login <username> <password> 192.168.131.96:8080
 
-```bash
-gitimg push "Commit message"
-```
-
----
+    # Sync assets (no manual init required)
+    gitimg push "First LAN sync"
 
 ## API Access
 
-GitImg exposes a JSON REST API alongside the embedded web dashboard.
+GitImg provides a JSON REST API alongside its embedded dashboard.
 
-### Authentication
-
-```http
-POST /auth/login
-```
+* Auth: POST /auth/login
+* Metadata: GET /repo/<owner>/<repo>
+* Assets: GET /repo/asset/<owner>/<repo>
 
 ---
-
-### Repository Metadata
-
-```http
-GET /repo/<owner>/<repo>
-```
-
----
-
-### Asset Access
-
-```http
-GET /repo/<owner>/<repo>/asset/<asset_id>
-```
-
----
-
-## Design Goals
-
-GitImg aims to provide:
-
-* High-performance binary versioning
-* Efficient deduplication
-* Git-like workflows for artists
-* Lightweight infrastructure
-* GitHub-style collaboration for creative assets
-
----
-
-Built for high-performance artistic workflows.
+*Built for high-performance artistic workflows.*
