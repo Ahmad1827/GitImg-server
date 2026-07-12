@@ -146,7 +146,8 @@ void ServerHub::generate_thumbnail(uint64_t m_hash) {
 
     char tmp_thumb[1024]; snprintf(tmp_thumb, sizeof(tmp_thumb), "/tmp/gitimg_%lx.thumb", m_hash);
     char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "convert %s -auto-orient -thumbnail 400x400^ -gravity center -extent 400x400 %s 2>/dev/null", tmp_orig, tmp_thumb);
+    // Adding [0] guarantees that multi-frame payloads like GIFs or WebPs export exactly one static frame for the thumbnail
+    snprintf(cmd, sizeof(cmd), "convert \"%s[0]\" -auto-orient -thumbnail 400x400^ -gravity center -extent 400x400 \"%s\" 2>/dev/null", tmp_orig, tmp_thumb);
     int ret = system(cmd);
     
     char thumb_path[2048]; snprintf(thumb_path, sizeof(thumb_path), "%s/thumbnails/%lx.thumb", base_dir, m_hash);
@@ -199,13 +200,16 @@ bool ServerHub::check_repo_access(const char* owner, const char* repo, const cha
     }
     free(buf);
 
+    if (!is_write && visibility == 0) {
+        return true;
+    }
+
     if (strcmp(r_owner, owner) != 0) return false; 
     if (strcmp(auth_user, r_owner) == 0) return true;
     
     bool is_collab = (strlen(auth_user) > 0 && strstr(collabs, auth_user) != NULL);
     if (is_collab) return true;
     if (is_write) return false;
-    if (visibility == 0) return true;
 
     return false;
 }
@@ -235,12 +239,10 @@ void ServerHub::process_post(int client_fd, const char* path, const char* auth_u
         if (UserManager::verify_login(base_dir, username, password)) {
             char token[65]; UserManager::create_session(base_dir, username, token);
             char resp[512]; snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"token\":\"%s\"}", token);
-            printf("[Auth] Login Success | User: %s | Client IP: %s\n", username, real_ip);
             if(write(client_fd, resp, strlen(resp))) {}
         } else {
             UserMetadata u;
             if (!UserManager::get_user(base_dir, username, &u)) {
-                printf("[Auth] Auto-registering new artist: %s\n", username);
                 UserManager::create_user(base_dir, username, "artist@lan.local", password);
                 char token[65]; UserManager::create_session(base_dir, username, token);
                 
@@ -251,7 +253,6 @@ void ServerHub::process_post(int client_fd, const char* path, const char* auth_u
                 if(write(client_fd, resp, strlen(resp))) {}
             } else {
                 std::string resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"invalid credentials\"}";
-                printf("[Auth] Login Failed | User: %s | Client IP: %s\n", username, real_ip);
                 if(write(client_fd, resp.c_str(), resp.length())) {}
             }
         }
@@ -413,7 +414,7 @@ std::string ServerHub::build_html_header(const std::string& title) {
     oss << "</style></head><body>";
     oss << "<div class=\"navbar\">";
     oss << "<a href=\"/\" class=\"logo\">GitImg</a>";
-    oss << "<div class=\"nav-links\"><form action=\"/search\" method=\"GET\"><input type=\"text\" name=\"q\" class=\"search-bar\" placeholder=\"Search artists, repos...\"></form></div>";
+    oss << "<div class=\"nav-links\"><form action=\"/search\" method=\"GET\"><input type=\"text\" name=\"q\" class=\"search-bar\" placeholder=\"Search artists...\"></form></div>";
     oss << "</div><div class=\"container\">";
     return oss.str();
 }
@@ -423,11 +424,8 @@ std::string ServerHub::build_html_footer() {
 }
 
 void ServerHub::handle_client(int client_fd) {
-    struct timeval tv;
-    tv.tv_sec = 2;
-    tv.tv_usec = 0;
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+    struct timeval tv; tv.tv_sec = 2; tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     req_count++;
     char header_buf[8192];
@@ -519,7 +517,7 @@ void ServerHub::handle_client(int client_fd) {
         }
         else if (strcmp(path, "/") == 0) {
             std::string html = build_html_header("Home");
-            html += "<h2>Recent Activity</h2><div style=\"background:#161b22;border:1px solid #30363d;border-radius:8px;padding:0 20px;\">";
+            html += "<h2>Recent Activity</h2><div class=\"card\" style=\"padding:0 20px;\">";
             
             char a_path[2048]; snprintf(a_path, sizeof(a_path), "%s/activities/global.log", base_dir);
             int fd = open(a_path, O_RDONLY);
@@ -590,7 +588,7 @@ void ServerHub::handle_client(int client_fd) {
             if(write(client_fd, html.c_str(), html.length())) {}
         }
         else {
-            char p1[128]={0}, p2[128]={0}, p3[128]={0}, p4[128]={0};
+            char p1[128]={0}, p2[128]={0}, p3[128]={0}, p4[128]={0}, p5[256]={0};
             const char* p = path; if (p[0] == '/') p++;
             const char* s1 = strchr(p, '/');
             if (s1) {
@@ -603,7 +601,14 @@ void ServerHub::handle_client(int client_fd) {
                     const char* s3 = strchr(p_next2, '/');
                     if(s3) {
                         strncpy(p3, p_next2, s3 - p_next2); p3[s3-p_next2]='\0';
-                        strcpy(p4, s3 + 1);
+                        const char* p_next3 = s3 + 1;
+                        const char* s4 = strchr(p_next3, '/');
+                        if (s4) {
+                            strncpy(p4, p_next3, s4 - p_next3); p4[s4-p_next3]='\0';
+                            strcpy(p5, s4 + 1);
+                        } else {
+                            strcpy(p4, p_next3);
+                        }
                     } else {
                         strcpy(p3, p_next2);
                     }
@@ -613,7 +618,7 @@ void ServerHub::handle_client(int client_fd) {
             if (strlen(p1) > 0 && strlen(p2) > 0 && strcmp(p3, "asset") == 0 && strlen(p4) > 0) {
                 std::string html = build_html_header("Asset Viewer");
                 html += "<div style=\"margin-bottom:20px;\"><a href=\"/" + std::string(p1) + "/" + std::string(p2) + "\" class=\"btn-outline\">&larr; Back to Repository</a></div>";
-                html += "<div class=\"viewer-container\"><img src=\"/raw/" + std::string(p4) + "/image.png\" alt=\"Asset\"></div>";
+                html += "<div class=\"viewer-container\"><img src=\"/raw/" + std::string(p4) + "/" + std::string(p5) + "\" alt=\"Asset\"></div>";
                 html += "<div class=\"card asset-info\"><h2>Asset Details</h2><p>Manifest Hash: <span style=\"font-family:monospace;\">" + std::string(p4) + "</span></p></div>";
                 html += build_html_footer();
                 if(write(client_fd, html.c_str(), html.length())) {}
@@ -674,9 +679,9 @@ void ServerHub::handle_client(int client_fd) {
                                     if (c_file[0] != '\0') {
                                         asset_count++;
                                         gallery_html += "<div class=\"card asset-card\">";
-                                        gallery_html += "<a href=\"/" + std::string(p1) + "/" + std::string(p2) + "/asset/" + c_man + "\">";
+                                        gallery_html += "<a href=\"/" + std::string(p1) + "/" + std::string(p2) + "/asset/" + c_man + "/" + c_file + "\">";
                                         gallery_html += "<img src=\"/thumb/" + std::string(c_man) + "\" alt=\"Thumbnail\" loading=\"lazy\"></a>";
-                                        gallery_html += "<div class=\"asset-info\"><h4><a href=\"/" + std::string(p1) + "/" + std::string(p2) + "/asset/" + c_man + "\">" + c_file + "</a></h4>";
+                                        gallery_html += "<div class=\"asset-info\"><h4><a href=\"/" + std::string(p1) + "/" + std::string(p2) + "/asset/" + c_man + "/" + c_file + "\">" + c_file + "</a></h4>";
                                         double mb = atoll(c_size) / 1048576.0;
                                         char size_fmt[32]; snprintf(size_fmt, sizeof(size_fmt), "%.2f MB", mb);
                                         gallery_html += "<p>" + std::string(size_fmt) + " &bull; <span class=\"ts\">" + c_time + "</span></p>";

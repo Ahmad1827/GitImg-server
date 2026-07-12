@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -39,13 +40,14 @@ ClientRepo::ClientRepo(const char* dir, const char* default_host, int default_po
         int p;
         if (fscanf(fp, "%255s %d", h_buf, &p) == 2) {
             strncpy(srv_host, h_buf, sizeof(srv_host) - 1);
+            srv_host[sizeof(srv_host) - 1] = '\0';
             srv_port = p;
         }
         fclose(fp);
     }
     
-    strncpy(current_repo, "default", sizeof(current_repo));
-    strncpy(current_owner, "anonymous", sizeof(current_owner));
+    strncpy(current_repo, "default", sizeof(current_repo) - 1); current_repo[sizeof(current_repo) - 1] = '\0';
+    strncpy(current_owner, "anonymous", sizeof(current_owner) - 1); current_owner[sizeof(current_owner) - 1] = '\0';
     
     snprintf(config_path, sizeof(config_path), "%s/repo_name", repo_dir);
     int fd = open(config_path, O_RDONLY);
@@ -58,10 +60,10 @@ ClientRepo::ClientRepo(const char* dir, const char* default_host, int default_po
             char* slash = strchr(buf, '/');
             if (slash) {
                 *slash = '\0';
-                strncpy(current_owner, buf, 127);
-                strncpy(current_repo, slash + 1, 127);
+                strncpy(current_owner, buf, 127); current_owner[127] = '\0';
+                strncpy(current_repo, slash + 1, 127); current_repo[127] = '\0';
             } else {
-                strncpy(current_repo, buf, 127);
+                strncpy(current_repo, buf, 127); current_repo[127] = '\0';
             }
         }
         close(fd);
@@ -89,7 +91,7 @@ bool ClientRepo::init(const char* repo_target, const char* host, int port) {
     if (stat(object_dir, &st) == -1) mkdir(object_dir, 0755);
     if (stat(commit_dir, &st) == -1) mkdir(commit_dir, 0755);
     
-    strncpy(srv_host, host, sizeof(srv_host) - 1);
+    strncpy(srv_host, host, sizeof(srv_host) - 1); srv_host[sizeof(srv_host) - 1] = '\0';
     srv_port = port;
     char config_path[1024];
     snprintf(config_path, sizeof(config_path), "%s/remote_config", repo_dir);
@@ -102,12 +104,16 @@ bool ClientRepo::init(const char* repo_target, const char* host, int port) {
     const char* slash = strchr(repo_target, '/');
     if (slash) {
         size_t owner_len = slash - repo_target;
+        if (owner_len > 127) owner_len = 127;
         strncpy(current_owner, repo_target, owner_len);
         current_owner[owner_len] = '\0';
         strncpy(current_repo, slash + 1, sizeof(current_repo) - 1);
+        current_repo[sizeof(current_repo) - 1] = '\0';
     } else {
         strncpy(current_owner, "anonymous", sizeof(current_owner) - 1);
+        current_owner[sizeof(current_owner) - 1] = '\0';
         strncpy(current_repo, repo_target, sizeof(current_repo) - 1);
+        current_repo[sizeof(current_repo) - 1] = '\0';
     }
 
     snprintf(config_path, sizeof(config_path), "%s/repo_name", repo_dir);
@@ -118,23 +124,22 @@ bool ClientRepo::init(const char* repo_target, const char* host, int port) {
         if(write(fd, target_buf, strlen(target_buf))){}
         close(fd);
     }
-    
-    printf("Initialized workspace targeting %s:%d\n", srv_host, srv_port);
     return true;
 }
 
 bool ClientRepo::is_tracked_file(const char* filename) {
     const char* dot = strrchr(filename, '.');
     if (!dot) return false;
-    if (strcmp(dot, ".wpk") == 0) return true;
-    if (strcmp(dot, ".png") == 0) return true;
-    if (strcmp(dot, ".jpg") == 0 || strcmp(dot, ".jpeg") == 0) return true;
-    if (strcmp(dot, ".gif") == 0) return true;
-    if (strcmp(dot, ".webp") == 0) return true;
+    if (strcasecmp(dot, ".wpk") == 0) return true;
+    if (strcasecmp(dot, ".png") == 0) return true;
+    if (strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0) return true;
+    if (strcasecmp(dot, ".gif") == 0) return true;
+    if (strcasecmp(dot, ".webp") == 0) return true;
+    if (strcasecmp(dot, ".apng") == 0) return true;
     return false;
 }
 
-uint64_t ClientRepo::chunk_and_push(const char* filepath, uint64_t* out_size) {
+uint64_t ClientRepo::chunk_and_push(const char* filepath, uint64_t* out_size, uint32_t* skipped_chunks, uint32_t* new_chunks) {
     int fd = open(filepath, O_RDONLY);
     if (fd < 0) return 0;
 
@@ -164,9 +169,12 @@ uint64_t ClientRepo::chunk_and_push(const char* filepath, uint64_t* out_size) {
         
         if (!Protocol::check_chunk(srv_host, srv_port, chunk_hash)) {
             Protocol::push_chunk(srv_host, srv_port, chunk_hash, file_data + offset, chunk_size);
+            (*new_chunks)++;
+        } else {
+            (*skipped_chunks)++;
         }
 
-        char obj_path[2048];
+        char obj_path[1024];
         snprintf(obj_path, sizeof(obj_path), "%s/objects/%lx", repo_dir, chunk_hash);
         int obj_fd = open(obj_path, O_WRONLY | O_CREAT, 0644);
         if (obj_fd >= 0) {
@@ -178,7 +186,7 @@ uint64_t ClientRepo::chunk_and_push(const char* filepath, uint64_t* out_size) {
         offset += chunk_size;
     }
 
-    char manifest_path[2048];
+    char manifest_path[1024];
     snprintf(manifest_path, sizeof(manifest_path), "%s/manifests/%lx.manifest", repo_dir, full_hash);
     manifest.save_to_file(manifest_path);
 
@@ -200,6 +208,8 @@ bool ClientRepo::commit(const char* message) {
 
     PendingAsset assets[512];
     size_t asset_count = 0;
+    uint32_t total_skipped = 0;
+    uint32_t total_new = 0;
 
     char commit_buffer[4096];
     time_t now = time(NULL);
@@ -208,11 +218,11 @@ bool ClientRepo::commit(const char* message) {
     struct dirent* ent;
     while ((ent = readdir(dir)) != NULL) {
         if (is_tracked_file(ent->d_name)) {
-            char full_path[2048];
+            char full_path[1024];
             snprintf(full_path, sizeof(full_path), "%s/%s", base_dir, ent->d_name);
             
             uint64_t f_size = 0;
-            uint64_t file_hash = chunk_and_push(full_path, &f_size);
+            uint64_t file_hash = chunk_and_push(full_path, &f_size, &total_skipped, &total_new);
             
             if (asset_count < 512) {
                 strncpy(assets[asset_count].filename, ent->d_name, 255);
@@ -226,6 +236,10 @@ bool ClientRepo::commit(const char* message) {
     }
     closedir(dir);
 
+    if (asset_count == 0) return true;
+
+    printf("Uploading %zu assets...\n", asset_count);
+
     uint64_t commit_hash = CDCHasher::fnv1a_hash((uint8_t*)commit_buffer, pos);
     
     if (!Protocol::push_commit(srv_host, srv_port, current_owner, current_repo, commit_hash, (uint8_t*)commit_buffer, pos)) {
@@ -236,14 +250,14 @@ bool ClientRepo::commit(const char* message) {
         AssetMetadata meta;
         RepositoryManager::generate_asset_id(assets[i].filename, commit_hash, meta.asset_id);
         strncpy(meta.filename, assets[i].filename, 255); meta.filename[255] = '\0';
-        strncpy(meta.mime_type, RepositoryManager::detect_mime_type(assets[i].filename), 63);
+        strncpy(meta.mime_type, RepositoryManager::detect_mime_type(assets[i].filename), 63); meta.mime_type[63] = '\0';
         meta.upload_time = now;
         meta.commit_hash = commit_hash;
         meta.manifest_hash = assets[i].manifest_hash;
         meta.file_size = assets[i].file_size;
         meta.width = 0;
         meta.height = 0;
-        strncpy(meta.thumbnail_path, "pending_gen", 255);
+        strncpy(meta.thumbnail_path, "pending_gen", 255); meta.thumbnail_path[255] = '\0';
         
         char meta_buf[1024];
         size_t m_len = RepositoryManager::serialize_asset(&meta, meta_buf, sizeof(meta_buf));
@@ -252,11 +266,15 @@ bool ClientRepo::commit(const char* message) {
         }
     }
 
+    printf("Skipped %u duplicate chunks.\n", total_skipped);
+    printf("Uploaded %u new chunks.\n", total_new);
+    printf("Generating thumbnails...\n");
+
     return true;
 }
 
 bool ClientRepo::checkout(const char* commit_hash_str) {
-    char commit_path[2048];
+    char commit_path[1024];
     snprintf(commit_path, sizeof(commit_path), "%s/commits/%s.commit", repo_dir, commit_hash_str);
 
     if (!Protocol::fetch_commit(srv_host, srv_port, commit_hash_str, commit_path)) {
@@ -278,7 +296,7 @@ bool ClientRepo::checkout(const char* commit_hash_str) {
             uint64_t m_hash;
             char fname[512];
             if (sscanf(line, "%lx %511s", &m_hash, fname) == 2) {
-                char manifest_path[2048];
+                char manifest_path[1024];
                 snprintf(manifest_path, sizeof(manifest_path), "%s/manifests/%lx.manifest", repo_dir, m_hash);
                 
                 if (!Protocol::fetch_manifest(srv_host, srv_port, m_hash, manifest_path)) {
@@ -288,7 +306,7 @@ bool ClientRepo::checkout(const char* commit_hash_str) {
                 int m_fd = open(manifest_path, O_RDONLY);
                 if (m_fd < 0) continue;
 
-                char target_path[2048];
+                char target_path[1024];
                 snprintf(target_path, sizeof(target_path), "%s/%s", base_dir, fname);
                 int target_fd = open(target_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
                 if (target_fd < 0) {
@@ -298,7 +316,7 @@ bool ClientRepo::checkout(const char* commit_hash_str) {
 
                 uint64_t chunk_hash;
                 while (read(m_fd, &chunk_hash, sizeof(uint64_t)) == sizeof(uint64_t)) {
-                    char obj_path[2048];
+                    char obj_path[1024];
                     snprintf(obj_path, sizeof(obj_path), "%s/objects/%lx", repo_dir, chunk_hash);
 
                     struct stat st;

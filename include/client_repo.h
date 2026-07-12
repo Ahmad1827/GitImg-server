@@ -26,7 +26,7 @@ private:
     int watch_fd;
 
     bool is_tracked_file(const char* filename);
-    uint64_t chunk_and_push(const char* filepath, uint64_t* out_size);
+    uint64_t chunk_and_push(const char* filepath, uint64_t* out_size, uint32_t* skipped_chunks, uint32_t* new_chunks);
     void handle_events(int fd);
 };
 
