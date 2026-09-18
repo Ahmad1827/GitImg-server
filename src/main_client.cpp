@@ -13,7 +13,7 @@ int g_port = 8080;
 void save_global_config(const char* username, const char* token, const char* host, int port) {
     char path[1024]; snprintf(path, sizeof(path), "%s/.gitimg_credentials", getenv("HOME"));
     FILE* f = fopen(path, "w"); 
-    if(f) { 
+    if (f) { 
         fprintf(f, "%s\n%s\n%s\n%d\n", username, token, host, port); 
         fclose(f); 
     }
@@ -22,7 +22,7 @@ void save_global_config(const char* username, const char* token, const char* hos
 void load_global_config() {
     char path[1024]; snprintf(path, sizeof(path), "%s/.gitimg_credentials", getenv("HOME"));
     FILE* f = fopen(path, "r");
-    if(f) { 
+    if (f) { 
         char token[256] = {0};
         if (fscanf(f, "%63s\n%255s\n%255s\n%d", g_username, token, g_host, &g_port) >= 2) { 
             Protocol::set_token(token); 
@@ -52,6 +52,8 @@ void print_usage() {
     printf("Usage:\n");
     printf("  gitimg login\n");
     printf("  gitimg push [\"message\"]\n");
+    printf("  gitimg log [--json]\n");
+    printf("  gitimg checkout <commit_id>\n");
     printf("  gitimg logout\n");
 }
 
@@ -146,6 +148,31 @@ int main(int argc, char* argv[]) {
             printf("Done.\n");
             printf("View your repository:\n");
             printf("http://%s:%d/%s\n", g_host, g_port, target);
+        }
+    }
+    else if (strcmp(argv[1], "log") == 0) {
+        bool json_format = false;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--json") == 0) {
+                json_format = true;
+            }
+        }
+        ClientRepo repo(".", g_host, g_port);
+        if (!repo.log(json_format)) {
+            return EXIT_FAILURE;
+        }
+    }
+    else if (strcmp(argv[1], "checkout") == 0) {
+        if (argc < 3) {
+            printf("Error: Missing commit hash.\n");
+            printf("Usage: gitimg checkout <commit_id>\n");
+            return EXIT_FAILURE;
+        }
+        const char* target_id = argv[2];
+        ClientRepo repo(".", g_host, g_port);
+        if (!repo.checkout(target_id)) {
+            printf("Error: Checkout failed for commit '%s'.\n", target_id);
+            return EXIT_FAILURE;
         }
     }
     else {

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -47,7 +48,7 @@ bool Protocol::send_http_get(const char* host, int port, const char* endpoint) {
              "Authorization: Bearer %s\r\nConnection: close\r\n\r\n",
              endpoint, host, port, g_auth_token);
 
-    if(write(sock, header, strlen(header))){}
+    if (write(sock, header, strlen(header))) {}
     char response[1024];
     ssize_t bytes = read(sock, response, sizeof(response) - 1);
     close(sock);
@@ -69,20 +70,22 @@ bool Protocol::fetch_http_get(const char* host, int port, const char* endpoint, 
              "Authorization: Bearer %s\r\nConnection: close\r\n\r\n",
              endpoint, host, port, g_auth_token);
              
-    if(write(sock, header, strlen(header))){}
-    char response[8192];
-    ssize_t bytes = read(sock, response, sizeof(response) - 1);
+    if (write(sock, header, strlen(header))) {}
+
+    std::string response;
+    char chunk[4096];
+    ssize_t bytes;
+    while ((bytes = read(sock, chunk, sizeof(chunk))) > 0) {
+        response.append(chunk, bytes);
+    }
     close(sock);
 
-    if (bytes > 0) {
-        response[bytes] = '\0';
-        char* body = strstr(response, "\r\n\r\n");
-        if (body && strstr(response, "200 OK") != NULL) {
-            body += 4;
-            strncpy(out_buffer, body, max_len - 1);
-            out_buffer[max_len - 1] = '\0';
-            return true;
-        }
+    size_t header_end = response.find("\r\n\r\n");
+    if (header_end != std::string::npos && response.find("200 OK") != std::string::npos) {
+        std::string body = response.substr(header_end + 4);
+        strncpy(out_buffer, body.c_str(), max_len - 1);
+        out_buffer[max_len - 1] = '\0';
+        return true;
     }
     return false;
 }
@@ -97,7 +100,7 @@ bool Protocol::fetch_to_file(const char* host, int port, const char* endpoint, c
              "Authorization: Bearer %s\r\nConnection: close\r\n\r\n",
              endpoint, host, port, g_auth_token);
              
-    if(write(sock, header, strlen(header))){}
+    if (write(sock, header, strlen(header))) {}
     char buf[16384];
     ssize_t bytes = read(sock, buf, sizeof(buf));
     if (bytes <= 0) { close(sock); return false; }
@@ -116,9 +119,9 @@ bool Protocol::fetch_to_file(const char* host, int port, const char* endpoint, c
 
     ssize_t header_len = body_start - buf;
     ssize_t body_bytes = bytes - header_len;
-    if (body_bytes > 0) { if(write(fd, body_start, body_bytes)){} }
+    if (body_bytes > 0) { if (write(fd, body_start, body_bytes)) {} }
 
-    while ((bytes = read(sock, buf, sizeof(buf))) > 0) { if(write(fd, buf, bytes)){} }
+    while ((bytes = read(sock, buf, sizeof(buf))) > 0) { if (write(fd, buf, bytes)) {} }
 
     close(fd); close(sock);
     return true;
@@ -134,7 +137,7 @@ bool Protocol::send_http_post(const char* host, int port, const char* endpoint, 
              "Authorization: Bearer %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
              endpoint, host, port, g_auth_token, size);
 
-    if(write(sock, header, strlen(header))){}
+    if (write(sock, header, strlen(header))) {}
     size_t total_sent = 0;
     while (total_sent < size) {
         ssize_t sent = write(sock, data + total_sent, size - total_sent);
@@ -143,12 +146,12 @@ bool Protocol::send_http_post(const char* host, int port, const char* endpoint, 
     }
 
     char response[2048] = {0};
-    if(read(sock, response, sizeof(response) - 1)){}
+    if (read(sock, response, sizeof(response) - 1)) {}
     close(sock);
     
     if (out_resp) {
         char* body = strstr(response, "\r\n\r\n");
-        if(body) {
+        if (body) {
             strncpy(out_resp, body + 4, 1023);
         }
     }
@@ -161,12 +164,12 @@ bool Protocol::login(const char* host, int port, const char* username, const cha
     snprintf(json, sizeof(json), "{\"username\":\"%s\",\"password\":\"%s\"}", username, password);
     char resp[1024] = {0};
     
-    if(send_http_post(host, port, "/auth/login", (const uint8_t*)json, strlen(json), resp)) {
+    if (send_http_post(host, port, "/auth/login", (const uint8_t*)json, strlen(json), resp)) {
         char* token_start = strstr(resp, "\"token\":\"");
-        if(token_start) {
+        if (token_start) {
             token_start += 9;
             char* token_end = strchr(token_start, '"');
-            if(token_end) {
+            if (token_end) {
                 size_t len = token_end - token_start;
                 strncpy(out_token, token_start, len);
                 out_token[len] = '\0';
@@ -198,7 +201,7 @@ bool Protocol::push_manifest(const char* host, int port, uint64_t hash, const ui
 }
 
 bool Protocol::push_commit(const char* host, int port, const char* owner, const char* repo_name, uint64_t hash, const uint8_t* data, size_t size) {
-    (void)hash; // Intentionally unused since it is recomputed on the server side to ensure integrity
+    (void)hash;
     char endpoint[512]; snprintf(endpoint, sizeof(endpoint), "/repo/%s/%s/push", owner, repo_name);
     return send_http_post(host, port, endpoint, data, size);
 }

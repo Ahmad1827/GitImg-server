@@ -4,6 +4,14 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string>
+#include <vector>
+
+struct CommitEntry {
+    std::string hash;
+    uint64_t timestamp;
+    std::string message;
+};
 
 class ClientRepo {
 public:
@@ -13,6 +21,8 @@ public:
     bool init(const char* repo_target, const char* host, int port);
     bool commit(const char* message);
     bool checkout(const char* commit_hash_str);
+    bool log(bool json_format);
+    std::vector<CommitEntry> get_commit_list();
     void watch();
 
 private:

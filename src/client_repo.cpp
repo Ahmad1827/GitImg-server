@@ -16,6 +16,9 @@
 #include <dirent.h>
 #include <time.h>
 #include <errno.h>
+#include <string>
+#include <vector>
+#include <sstream>
 
 struct PendingAsset {
     char filename[256];
@@ -56,7 +59,7 @@ ClientRepo::ClientRepo(const char* dir, const char* default_host, int default_po
         ssize_t bytes = read(fd, buf, sizeof(buf) - 1);
         if (bytes > 0) {
             buf[bytes] = '\0';
-            for (int i=0; i<bytes; i++) if (buf[i] == '\n') buf[i] = '\0';
+            for (int i = 0; i < bytes; i++) if (buf[i] == '\n') buf[i] = '\0';
             char* slash = strchr(buf, '/');
             if (slash) {
                 *slash = '\0';
@@ -121,7 +124,7 @@ bool ClientRepo::init(const char* repo_target, const char* host, int port) {
     if (fd >= 0) {
         char target_buf[256];
         snprintf(target_buf, sizeof(target_buf), "%s/%s", current_owner, current_repo);
-        if(write(fd, target_buf, strlen(target_buf))){}
+        if (write(fd, target_buf, strlen(target_buf))) {}
         close(fd);
     }
     return true;
@@ -178,7 +181,7 @@ uint64_t ClientRepo::chunk_and_push(const char* filepath, uint64_t* out_size, ui
         snprintf(obj_path, sizeof(obj_path), "%s/objects/%lx", repo_dir, chunk_hash);
         int obj_fd = open(obj_path, O_WRONLY | O_CREAT, 0644);
         if (obj_fd >= 0) {
-            if(write(obj_fd, file_data + offset, chunk_size)){}
+            if (write(obj_fd, file_data + offset, chunk_size)) {}
             close(obj_fd);
         }
 
@@ -242,6 +245,22 @@ bool ClientRepo::commit(const char* message) {
 
     uint64_t commit_hash = CDCHasher::fnv1a_hash((uint8_t*)commit_buffer, pos);
     
+    char local_commit_path[1024];
+    snprintf(local_commit_path, sizeof(local_commit_path), "%s/commits/%lx.commit", repo_dir, commit_hash);
+    int c_fd = open(local_commit_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (c_fd >= 0) {
+        if (write(c_fd, commit_buffer, pos)) {}
+        close(c_fd);
+    }
+
+    char head_path[1024];
+    snprintf(head_path, sizeof(head_path), "%s/HEAD", repo_dir);
+    FILE* hf = fopen(head_path, "w");
+    if (hf) {
+        fprintf(hf, "%lx\n", commit_hash);
+        fclose(hf);
+    }
+
     if (!Protocol::push_commit(srv_host, srv_port, current_owner, current_repo, commit_hash, (uint8_t*)commit_buffer, pos)) {
         return false;
     }
@@ -273,22 +292,155 @@ bool ClientRepo::commit(const char* message) {
     return true;
 }
 
-bool ClientRepo::checkout(const char* commit_hash_str) {
-    char commit_path[1024];
-    snprintf(commit_path, sizeof(commit_path), "%s/commits/%s.commit", repo_dir, commit_hash_str);
+std::vector<CommitEntry> ClientRepo::get_commit_list() {
+    std::vector<CommitEntry> commits;
+    char endpoint[512];
+    snprintf(endpoint, sizeof(endpoint), "/api/commits/%s/%s", current_owner, current_repo);
 
-    if (!Protocol::fetch_commit(srv_host, srv_port, commit_hash_str, commit_path)) {
-        return false;
+    std::vector<char> buffer(65536, 0);
+    if (!Protocol::fetch_http_get(srv_host, srv_port, endpoint, buffer.data(), buffer.size())) {
+        return commits;
+    }
+
+    std::string json(buffer.data());
+    size_t pos = 0;
+    while ((pos = json.find('{', pos)) != std::string::npos) {
+        size_t end = json.find('}', pos);
+        if (end == std::string::npos) break;
+
+        std::string obj = json.substr(pos, end - pos + 1);
+        CommitEntry entry;
+        entry.timestamp = 0;
+
+        size_t hash_pos = obj.find("\"hash\":");
+        if (hash_pos != std::string::npos) {
+            size_t q1 = obj.find('"', hash_pos + 7);
+            if (q1 != std::string::npos) {
+                size_t q2 = obj.find('"', q1 + 1);
+                if (q2 != std::string::npos) {
+                    entry.hash = obj.substr(q1 + 1, q2 - q1 - 1);
+                }
+            }
+        }
+
+        size_t msg_pos = obj.find("\"msg\":");
+        if (msg_pos != std::string::npos) {
+            size_t q1 = obj.find('"', msg_pos + 6);
+            if (q1 != std::string::npos) {
+                size_t q2 = obj.find('"', q1 + 1);
+                if (q2 != std::string::npos) {
+                    entry.message = obj.substr(q1 + 1, q2 - q1 - 1);
+                }
+            }
+        }
+
+        size_t time_pos = obj.find("\"time\":");
+        if (time_pos != std::string::npos) {
+            size_t val_start = time_pos + 7;
+            while (val_start < obj.size() && (obj[val_start] == ' ' || obj[val_start] == ':')) val_start++;
+            entry.timestamp = strtoull(obj.c_str() + val_start, nullptr, 10);
+        }
+
+        if (!entry.hash.empty()) {
+            commits.push_back(entry);
+        }
+        pos = end + 1;
+    }
+
+    return commits;
+}
+
+bool ClientRepo::log(bool json_format) {
+    auto commits = get_commit_list();
+    if (commits.empty()) {
+        if (json_format) {
+            printf("[]\n");
+        } else {
+            printf("No commits found for %s/%s.\n", current_owner, current_repo);
+        }
+        return true;
+    }
+
+    if (json_format) {
+        printf("[\n");
+        for (size_t i = 0; i < commits.size(); i++) {
+            printf("  {\n");
+            printf("    \"commit_hash\": \"%s\",\n", commits[i].hash.c_str());
+            printf("    \"timestamp\": %lu,\n", commits[i].timestamp);
+            printf("    \"commit_message\": \"%s\"\n", commits[i].message.c_str());
+            printf("  }%s\n", (i + 1 < commits.size()) ? "," : "");
+        }
+        printf("]\n");
+    } else {
+        for (const auto& c : commits) {
+            printf("%s|%lu|%s\n", c.hash.c_str(), c.timestamp, c.message.c_str());
+        }
+    }
+
+    return true;
+}
+
+bool ClientRepo::checkout(const char* commit_hash_str) {
+    std::string target_hash = commit_hash_str;
+    auto commits = get_commit_list();
+    for (const auto& c : commits) {
+        if (c.hash.rfind(commit_hash_str, 0) == 0) {
+            target_hash = c.hash;
+            break;
+        }
+    }
+
+    char commit_path[1024];
+    snprintf(commit_path, sizeof(commit_path), "%s/commits/%s.commit", repo_dir, target_hash.c_str());
+
+    if (access(commit_path, F_OK) != 0) {
+        if (!Protocol::fetch_commit(srv_host, srv_port, target_hash.c_str(), commit_path)) {
+            return false;
+        }
     }
 
     FILE* fp = fopen(commit_path, "r");
     if (!fp) return false;
 
+    char rollback_dir[1024];
+    snprintf(rollback_dir, sizeof(rollback_dir), "%s/rollback", repo_dir);
+    mkdir(rollback_dir, 0755);
+
+    DIR* d = opendir(base_dir);
+    if (d) {
+        struct dirent* ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (is_tracked_file(ent->d_name)) {
+                char src[1024];
+                snprintf(src, sizeof(src), "%s/%s", base_dir, ent->d_name);
+                char dst[1024];
+                snprintf(dst, sizeof(dst), "%s/%s", rollback_dir, ent->d_name);
+
+                FILE* fsrc = fopen(src, "rb");
+                if (fsrc) {
+                    FILE* fdst = fopen(dst, "wb");
+                    if (fdst) {
+                        char buf[8192];
+                        size_t n;
+                        while ((n = fread(buf, 1, sizeof(buf), fsrc)) > 0) {
+                            fwrite(buf, 1, n, fdst);
+                        }
+                        fclose(fdst);
+                    }
+                    fclose(fsrc);
+                }
+                unlink(src);
+            }
+        }
+        closedir(d);
+    }
+
     char line[1024];
     bool reading_files = false;
+    int restored_count = 0;
 
     while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '\n') {
+        if (line[0] == '\n' || line[0] == '\r') {
             reading_files = true;
             continue;
         }
@@ -299,8 +451,10 @@ bool ClientRepo::checkout(const char* commit_hash_str) {
                 char manifest_path[1024];
                 snprintf(manifest_path, sizeof(manifest_path), "%s/manifests/%lx.manifest", repo_dir, m_hash);
                 
-                if (!Protocol::fetch_manifest(srv_host, srv_port, m_hash, manifest_path)) {
-                    continue;
+                if (access(manifest_path, F_OK) != 0) {
+                    if (!Protocol::fetch_manifest(srv_host, srv_port, m_hash, manifest_path)) {
+                        continue;
+                    }
                 }
 
                 int m_fd = open(manifest_path, O_RDONLY);
@@ -331,17 +485,28 @@ bool ClientRepo::checkout(const char* commit_hash_str) {
                         char buf[16384];
                         ssize_t bytes_read;
                         while ((bytes_read = read(obj_fd, buf, sizeof(buf))) > 0) {
-                            if(write(target_fd, buf, bytes_read)){}
+                            if (write(target_fd, buf, bytes_read)) {}
                         }
                         close(obj_fd);
                     }
                 }
                 close(target_fd);
                 close(m_fd);
+                restored_count++;
             }
         }
     }
     fclose(fp);
+
+    char head_path[1024];
+    snprintf(head_path, sizeof(head_path), "%s/HEAD", repo_dir);
+    FILE* hf = fopen(head_path, "w");
+    if (hf) {
+        fprintf(hf, "%s\n", target_hash.c_str());
+        fclose(hf);
+    }
+
+    printf("HEAD is now at %s (%d files restored)\n", target_hash.substr(0, 7).c_str(), restored_count);
     return true;
 }
 
