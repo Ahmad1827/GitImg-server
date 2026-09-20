@@ -6,9 +6,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <errno.h>
 
 char Protocol::g_auth_token[256] = {0};
 
@@ -28,12 +31,53 @@ int Protocol::connect_server(const char* host, int port) {
     if (getaddrinfo(host, port_str, &hints, &res) != 0) return -1;
     
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) { freeaddrinfo(res); return -1; }
-    
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        close(sock); freeaddrinfo(res); return -1;
+    if (sock < 0) { 
+        freeaddrinfo(res); 
+        return -1; 
     }
-    
+
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    int conn_res = connect(sock, res->ai_addr, res->ai_addrlen);
+    if (conn_res < 0) {
+        if (errno == EINPROGRESS) {
+            fd_set fdset;
+            FD_ZERO(&fdset);
+            FD_SET(sock, &fdset);
+            struct timeval tv;
+            tv.tv_sec = 3;
+            tv.tv_usec = 0;
+
+            if (select(sock + 1, NULL, &fdset, NULL, &tv) > 0) {
+                int so_error = 0;
+                socklen_t len = sizeof(so_error);
+                getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
+                if (so_error != 0) {
+                    close(sock);
+                    freeaddrinfo(res);
+                    return -1;
+                }
+            } else {
+                close(sock);
+                freeaddrinfo(res);
+                return -1;
+            }
+        } else {
+            close(sock);
+            freeaddrinfo(res);
+            return -1;
+        }
+    }
+
+    fcntl(sock, F_SETFL, flags);
+
+    struct timeval rw_tv;
+    rw_tv.tv_sec = 4;
+    rw_tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rw_tv, sizeof(rw_tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&rw_tv, sizeof(rw_tv));
+
     freeaddrinfo(res);
     return sock;
 }
