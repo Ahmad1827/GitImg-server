@@ -673,7 +673,7 @@ void ServerHub::handle_client(int client_fd) {
     if (strcmp(method, "OPTIONS") == 0) {
         std::string resp = "HTTP/1.1 204 No Content\r\n"
                            "Access-Control-Allow-Origin: *\r\n"
-                           "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                           "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
                            "Access-Control-Allow-Headers: Content-Type, Authorization, X-Repo-Name, X-Filename, X-Commit-Msg\r\n"
                            "Access-Control-Max-Age: 86400\r\n"
                            "Connection: close\r\n\r\n";
@@ -699,6 +699,109 @@ void ServerHub::handle_client(int client_fd) {
         if (sscanf(auth_hdr + 22, "%64s", token) == 1) {
             UserManager::validate_session(base_dir, token, auth_user);
         }
+    }
+
+    if (strcmp(method, "DELETE") == 0) {
+        char target_owner[128] = {0}, target_repo[128] = {0};
+        int parsed = 0;
+        if (strncmp(path, "/api/repos/", 11) == 0) {
+            parsed = sscanf(path + 11, "%127[^/]/%127s", target_owner, target_repo);
+        } else if (strncmp(path, "/api/repo/", 10) == 0) {
+            parsed = sscanf(path + 10, "%127[^/]/%127s", target_owner, target_repo);
+        }
+
+        if (parsed < 2 || strlen(target_owner) == 0 || strlen(target_repo) == 0) {
+            std::string resp = "HTTP/1.1 400 Bad Request\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"invalid_request\"}";
+            if (write(client_fd, resp.c_str(), resp.length())) {}
+            close(client_fd);
+            return;
+        }
+
+        if (strlen(auth_user) == 0) {
+            std::string resp = "HTTP/1.1 401 Unauthorized\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"unauthorized\"}";
+            if (write(client_fd, resp.c_str(), resp.length())) {}
+            close(client_fd);
+            return;
+        }
+
+        if (strcmp(auth_user, target_owner) != 0) {
+            std::string resp = "HTTP/1.1 403 Forbidden\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"forbidden\"}";
+            if (write(client_fd, resp.c_str(), resp.length())) {}
+            close(client_fd);
+            return;
+        }
+
+        char a_path[2048];
+        snprintf(a_path, sizeof(a_path), "%s/repos/%s_assets.meta", base_dir, target_repo);
+        int afd = open(a_path, O_RDONLY);
+        if (afd >= 0) {
+            struct stat ast;
+            if (fstat(afd, &ast) == 0 && ast.st_size > 0) {
+                char* abuf = (char*)malloc((size_t)ast.st_size + 1);
+                ssize_t rb = read(afd, abuf, (size_t)ast.st_size);
+                if (rb >= 0) {
+                    abuf[rb] = '\0';
+                    char* aline = strtok(abuf, "\n");
+                    while (aline) {
+                        if (strncmp(aline, "MANIFEST: ", 10) == 0) {
+                            char m_hash_str[128] = {0};
+                            sscanf(aline + 10, "%127s", m_hash_str);
+                            if (strlen(m_hash_str) > 0) {
+                                char m_file[2048], t_file[2048];
+                                snprintf(m_file, sizeof(m_file), "%s/manifests/%s.manifest", base_dir, m_hash_str);
+                                snprintf(t_file, sizeof(t_file), "%s/thumbnails/%s.thumb", base_dir, m_hash_str);
+                                unlink(m_file);
+                                unlink(t_file);
+                            }
+                        }
+                        aline = strtok(NULL, "\n");
+                    }
+                }
+                free(abuf);
+            }
+            close(afd);
+            unlink(a_path);
+        }
+
+        char c_path[2048];
+        snprintf(c_path, sizeof(c_path), "%s/repos/%s_commits.meta", base_dir, target_repo);
+        int cfd = open(c_path, O_RDONLY);
+        if (cfd >= 0) {
+            struct stat cst;
+            if (fstat(cfd, &cst) == 0 && cst.st_size > 0) {
+                char* cbuf = (char*)malloc((size_t)cst.st_size + 1);
+                ssize_t rb = read(cfd, cbuf, (size_t)cst.st_size);
+                if (rb >= 0) {
+                    cbuf[rb] = '\0';
+                    char* cline = strtok(cbuf, "\n");
+                    while (cline) {
+                        char chash[128] = {0};
+                        if (sscanf(cline, "%127[^|]", chash) == 1 && strlen(chash) > 0) {
+                            char commit_obj[2048];
+                            snprintf(commit_obj, sizeof(commit_obj), "%s/commits/%s.commit", base_dir, chash);
+                            unlink(commit_obj);
+                        }
+                        cline = strtok(NULL, "\n");
+                    }
+                }
+                free(cbuf);
+            }
+            close(cfd);
+            unlink(c_path);
+        }
+
+        char r_path[2048];
+        snprintf(r_path, sizeof(r_path), "%s/repos/%s.repo", base_dir, target_repo);
+        unlink(r_path);
+
+        char act_target[256];
+        snprintf(act_target, sizeof(act_target), "%s/%s", target_owner, target_repo);
+        log_activity(auth_user, "deleted repository", act_target);
+
+        std::string resp = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"deleted\"}";
+        if (write(client_fd, resp.c_str(), resp.length())) {}
+        close(client_fd);
+        return;
     }
 
     if (strcmp(method, "POST") == 0) {
@@ -1024,12 +1127,12 @@ void ServerHub::handle_client(int client_fd) {
                     p2[s2 - p_next] = '\0';
                     const char* p_next2 = s2 + 1;
                     const char* s3 = strchr(p_next2, '/');
-                    if (s3) {
+                    if (s3) { 
                         strncpy(p3, p_next2, s3 - p_next2);
                         p3[s3 - p_next2] = '\0';
                         const char* p_next3 = s3 + 1;
                         const char* s4 = strchr(p_next3, '/');
-                        if (s4) {
+                        if (s4) { 
                             strncpy(p4, p_next3, s4 - p_next3);
                             p4[s4 - p_next3] = '\0';
                             strcpy(p5, s4 + 1);
