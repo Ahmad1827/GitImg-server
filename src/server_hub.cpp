@@ -983,10 +983,33 @@ void ServerHub::handle_client(int client_fd) {
             uint64_t m_hash = 0;
             char filename[256] = {0};
             bool is_thumb = (strncmp(path, "/thumb/", 7) == 0);
-            
+
             if (is_thumb) m_hash = strtoull(path + 7, NULL, 16);
             else if (strncmp(path, "/image/", 7) == 0) m_hash = strtoull(path + 7, NULL, 16);
             else sscanf(path, "/raw/%lx/%255s", &m_hash, filename);
+
+            char check_cpath[2048];
+            snprintf(check_cpath, sizeof(check_cpath), "%s/commits/%lx.commit", base_dir, m_hash);
+            int c_chk = open(check_cpath, O_RDONLY);
+            if (c_chk >= 0) {
+                char cbuf[2048];
+                ssize_t cr = read(c_chk, cbuf, sizeof(cbuf) - 1);
+                close(c_chk);
+                if (cr > 0) {
+                    cbuf[cr] = '\0';
+                    char* sep = strstr(cbuf, "\n\n");
+                    if (sep) {
+                        uint64_t real_mhash = 0;
+                        char real_fn[256] = {0};
+                        if (sscanf(sep + 2, "%lx %255s", &real_mhash, real_fn) >= 1 && real_mhash != 0) {
+                            m_hash = real_mhash;
+                            if (filename[0] == '\0' && real_fn[0] != '\0') {
+                                strncpy(filename, real_fn, sizeof(filename) - 1);
+                            }
+                        }
+                    }
+                }
+            }
             
             if (is_thumb) {
                 char thumb_path[2048];
